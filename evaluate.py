@@ -1,6 +1,6 @@
 """
-Per-question evaluation: scores any RAG record (from basic_rag.answer()
-or rag.answer_question_full()) against four metrics, using ONE fixed
+Per-question evaluation: scores any RAG record (from rag.answer_question_full()
+or advanced_rag.answer_advanced()) against four metrics, using ONE fixed
 rubric so scores are comparable across approaches:
 
   - Context Relevance : did retrieval return useful evidence?
@@ -9,12 +9,13 @@ rubric so scores are comparable across approaches:
   - Correctness        : matches a trusted reference answer (only scored
                           when a reference is supplied -- otherwise null)
 
-CAVEAT: the judge model is, by default, the same local model
-(config.JUDGE_MODEL) used for generation. Even a 7B-class model is a
-comparatively weak judge next to a frontier model -- treat these scores
-as indicative/directional, useful for spotting large regressions between
-approaches, not as ground truth. Point config.JUDGE_MODEL at a stronger
-model in LM Studio for anything you need to trust more.
+CAVEAT: the judge (config.JUDGE_MODEL) is, by default, the same Gemini
+model that writes the answers, and LLM judges tend to favour their own
+output. Treat the scores as directional -- good for spotting regressions
+between approaches, not as ground truth. For results you need to trust
+more, point config.JUDGE_MODEL at a stronger model (e.g.
+gemini-3.1-pro-preview; it costs about 2.7x more per token and its
+mandatory thinking makes each judgement slower and pricier).
 """
 import json
 import re
@@ -23,7 +24,6 @@ import uuid
 
 import config
 import generation
-from logging_utils import append_record, read_records
 
 
 _RUBRIC = """You are a strict evaluator for a document question-answering system.
@@ -109,12 +109,12 @@ Score the ANSWER now."""
     return scores
 
 
-def evaluate_record(rag_record: dict, reference: str = None, log: bool = True) -> dict:
+def evaluate_record(rag_record: dict, reference: str = None) -> dict:
     """
-    Scores one RAG record (as produced by basic_rag.answer() or
-    rag.answer_question_full() -- both share the same schema) against
-    the fixed four-metric rubric, and logs the combined record to
-    config.EVAL_LOG.
+    Scores one RAG record (as produced by rag.answer_question_full() or
+    advanced_rag.answer_advanced() -- both share the same schema) against
+    the fixed four-metric rubric, and returns the record with the scores
+    added.
     """
     start = time.perf_counter()
     try:
@@ -169,64 +169,4 @@ def evaluate_record(rag_record: dict, reference: str = None, log: bool = True) -
         "reference_available": bool(reference),
     })
 
-    if log:
-        append_record(config.EVAL_LOG, combined)
-
     return combined
-
-
-def summarize(path: str = None) -> dict:
-    """
-    Aggregates every logged eval record by `approach`, returning mean
-    scores per metric so you can compare basic_rag vs hybrid_rag (or
-    any other approach tag) at a glance.
-    """
-    path = path or config.EVAL_LOG
-    records = read_records(path)
-
-    by_approach = {}
-    for r in records:
-        approach = r.get("approach", "unknown")
-        by_approach.setdefault(approach, []).append(r)
-
-    summary = {}
-    metrics = ["context_relevance", "faithfulness", "answer_relevance", "correctness"]
-    for approach, recs in by_approach.items():
-        approach_summary = {"n": len(recs)}
-        for metric in metrics:
-            values = [r[metric] for r in recs if r.get(metric) is not None]
-            approach_summary[metric] = round(sum(values) / len(values), 2) if values else None
-        approach_summary["avg_input_tokens"] = round(
-            sum(r.get("input_tokens", 0) for r in recs) / len(recs), 1
-        )
-        approach_summary["avg_output_tokens"] = round(
-            sum(r.get("output_tokens", 0) for r in recs) / len(recs), 1
-        )
-        approach_summary["avg_cost"] = round(sum(r.get("cost", 0) for r in recs) / len(recs), 6)
-        approach_summary["avg_latency_seconds"] = round(
-            sum(r.get("latency_seconds", 0) for r in recs) / len(recs), 2
-        )
-        summary[approach] = approach_summary
-
-    return summary
-
-
-def print_summary(path: str = None):
-    summary = summarize(path)
-    if not summary:
-        print("No eval records found yet -- run evaluate_record() on some questions first.")
-        return
-    for approach, s in summary.items():
-        print(f"\n=== {approach} (n={s['n']}) ===")
-        print(f"  context_relevance : {s['context_relevance']}")
-        print(f"  faithfulness      : {s['faithfulness']}")
-        print(f"  answer_relevance  : {s['answer_relevance']}")
-        print(f"  correctness       : {s['correctness']}")
-        print(f"  avg input tokens  : {s['avg_input_tokens']}")
-        print(f"  avg output tokens : {s['avg_output_tokens']}")
-        print(f"  avg cost          : ${s['avg_cost']}")
-        print(f"  avg latency (s)   : {s['avg_latency_seconds']}")
-
-
-if __name__ == "__main__":
-    print_summary()

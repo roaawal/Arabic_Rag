@@ -75,8 +75,7 @@ def answer_advanced(question: str, decision: dict, top_k: int = None) -> dict:
     `has_metadata_constraints` too, since self_query is driven by that
     flag rather than being one of the router-selectable techniques.
 
-    Returns the same record schema as rag.answer_question_full()/
-    basic_rag.answer(), plus advanced-route-specific fields:
+    Returns the same record schema as rag.answer_question_full(), plus advanced-route-specific fields:
     techniques_used, executed_steps, retrieval_stats, search_queries,
     self_query_filter, crag_grade, crag_corrected.
     """
@@ -181,10 +180,7 @@ def answer_advanced(question: str, decision: dict, top_k: int = None) -> dict:
 
     input_tokens = result["input_tokens"]
     output_tokens = result["output_tokens"]
-    cost = (
-        (input_tokens / 1000) * config.COST_PER_1K_INPUT_TOKENS
-        + (output_tokens / 1000) * config.COST_PER_1K_OUTPUT_TOKENS
-    )
+    cost = generation.compute_cost(config.GENERATION_MODEL, input_tokens, output_tokens)
 
     techniques_used = sorted(
         set(techniques)
@@ -221,7 +217,7 @@ def answer_advanced(question: str, decision: dict, top_k: int = None) -> dict:
             for h in hits
         ],
         "context": context,
-        "answer": result["text"],
+        "answer": generation.strip_inline_sources(result["text"]),
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "cost": cost,

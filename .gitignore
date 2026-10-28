@@ -1,0 +1,8 @@
+.env
+.venv/
+__pycache__/
+chroma_store/
+ocr_cache/
+ground_truth/
+
+data/

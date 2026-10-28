@@ -4,8 +4,7 @@ Fusion) plus the plain "rag" route's end-to-end answer function.
 
 Final-answer prompting/LLM-calling now lives in generation.py and is
 shared across every route (direct, rag, advanced_rag) -- see
-that module's docstring. _build_prompt/_generate/_estimate_tokens are
-kept here as thin aliases so existing imports (basic_rag.py) don't break.
+that module's docstring.
 """
 import re
 
@@ -22,16 +21,6 @@ _collection = None
 _bm25_index = None
 _bm25_ids = None
 _bm25_doc_lookup = None
-
-# Backward-compatible aliases -- basic_rag.py does
-# `from rag import _dense_only_retrieve, _estimate_tokens`.
-_estimate_tokens = generation.estimate_tokens
-_build_prompt = generation.build_grounded_prompt
-
-
-def _generate(prompt: str, arabic: bool) -> dict:
-    return generation.call_llm(prompt, arabic=arabic)
-
 
 def _get_embed_model():
     global _embed_model
@@ -50,7 +39,7 @@ def _get_collection():
         except chromadb.errors.NotFoundError as e:
             raise RuntimeError(
                 f"Index collection '{config.COLLECTION_NAME}' was not found in "
-                f"'{config.CHROMA_DIR}'. Run `python build_index.py` first."
+                f"'{config.CHROMA_DIR}'. Run `python ingestion.py` first."
             ) from e
         except Exception as e:
             raise RuntimeError(
@@ -90,7 +79,7 @@ def _get_bm25():
     """
     Builds (and caches) a BM25 keyword index over every chunk already
     stored in Chroma. No re-indexing required -- this just reads the same
-    chunk text that build_index.py already embedded and stored.
+    chunk text that ingestion.py already embedded and stored.
     """
     global _bm25_index, _bm25_ids, _bm25_doc_lookup
     if _bm25_index is None:
@@ -157,7 +146,7 @@ def _bm25_search(question: str, pool: int, where: dict = None):
 
 def _dense_only_retrieve(question: str, top_k: int, where: dict = None):
     """Pure dense retrieval -- kept as a fallback if USE_HYBRID_RETRIEVAL is
-    turned off in config.py, and used directly by basic_rag.py as the
+    turned off in config.py, and used as the
     baseline retrieval method."""
     model = _get_embed_model()
     collection = _get_collection()
@@ -233,33 +222,11 @@ def retrieve(question: str, top_k: int = None, where: dict = None):
     return hits
 
 
-def _is_arabic(text: str) -> bool:
-    return generation.is_arabic(text)
-
-
-def answer_question(question: str, top_k: int = None, verbose: bool = True):
-    hits = retrieve(question, top_k=top_k)
-
-    if verbose:
-        print(f"\nRetrieved {len(hits)} chunks:")
-        for h in hits:
-            print(f"  - [{h['id']}] {h['source']} p.{h['page']} (score={h['score']:.3f})")
-
-    prompt = generation.build_grounded_prompt(question, hits)
-    try:
-        result = generation.call_llm(prompt, arabic=generation.is_arabic(question))
-    except requests.exceptions.ConnectionError:
-        raise RuntimeError(generation.connection_error_message())
-    return result["text"], hits
-
-
 def answer_question_full(question: str, top_k: int = None) -> dict:
     """
     Same pipeline as answer_question(), but returns the full structured
     record (question, chunk_ids, context, answer, tokens, cost, latency)
-    using the identical schema basic_rag.answer() uses -- so this
-    (hybrid + section-tagged) pipeline and the basic-RAG baseline can be
-    logged and compared apples-to-apples with evaluate.py.
+    in the schema evaluate.py expects.
     """
     import time
     import uuid
@@ -276,10 +243,7 @@ def answer_question_full(question: str, top_k: int = None) -> dict:
 
     input_tokens = result["input_tokens"]
     output_tokens = result["output_tokens"]
-    cost = (
-        (input_tokens / 1000) * config.COST_PER_1K_INPUT_TOKENS
-        + (output_tokens / 1000) * config.COST_PER_1K_OUTPUT_TOKENS
-    )
+    cost = generation.compute_cost(config.GENERATION_MODEL, input_tokens, output_tokens)
 
     return {
         "record_id": str(uuid.uuid4()),
@@ -304,7 +268,7 @@ def answer_question_full(question: str, top_k: int = None) -> dict:
             for h in hits
         ],
         "context": context,
-        "answer": result["text"],
+        "answer": generation.strip_inline_sources(result["text"]),
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "cost": cost,

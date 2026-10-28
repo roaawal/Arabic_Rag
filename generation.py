@@ -9,12 +9,10 @@ insufficient, cite chunk/page ids) are exactly the kind of thing that
 quietly drifts out of sync if every route builds its own prompt. Define
 them once, reuse everywhere.
 
-rag.py keeps thin backward-compatible aliases (_build_prompt, _generate,
-_estimate_tokens) pointing at this module, so existing code that imports
-those names (basic_rag.py) keeps working unmodified.
 """
 import os
 import re
+import sys
 import time
 from contextvars import ContextVar
 
@@ -39,22 +37,37 @@ def stop_call_tracking(token):
     return calls
 
 
+_warned_unpriced = set()
+
+
+def compute_cost(model: str, input_tokens: int, output_tokens: int) -> float:
+    """USD cost of one call from config.MODEL_PRICING (today's price).
+    Output tokens must include thinking tokens (the API bills them as
+    output). Unknown models cost 0.0 and are flagged once on stderr."""
+    price = config.price_per_million(model)
+    if price is None:
+        if model not in _warned_unpriced:
+            _warned_unpriced.add(model)
+            print(f"WARNING: no price for model {model!r} in config.MODEL_PRICING; "
+                  f"its cost is counted as $0.", file=sys.stderr)
+        return 0.0
+    return input_tokens / 1_000_000 * price[0] + output_tokens / 1_000_000 * price[1]
+
+
 def _record_call(stage: str, model: str, input_tokens: int, output_tokens: int,
-                latency_seconds: float, success: bool = True, tokens_estimated: bool = False):
+                latency_seconds: float, success: bool = True, tokens_estimated: bool = False,
+                reasoning_tokens: int = None):
     ledger = _call_ledger.get()
     if ledger is None:
         return
-    cost = (
-        (input_tokens / 1000) * config.COST_PER_1K_INPUT_TOKENS
-        + (output_tokens / 1000) * config.COST_PER_1K_OUTPUT_TOKENS
-    )
     ledger.append({
         "stage": stage,
         "model": model,
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
+        "reasoning_tokens": reasoning_tokens,
         "total_tokens": input_tokens + output_tokens,
-        "cost": cost,
+        "cost": compute_cost(model, input_tokens, output_tokens),
         "latency_seconds": latency_seconds,
         "tokens_estimated": tokens_estimated,
         "success": success,
@@ -63,65 +76,104 @@ def _record_call(stage: str, model: str, input_tokens: int, output_tokens: int,
     })
 
 
-def _base_url_for(model: str) -> str:
-    """
-    Which server hosts this model. Different local-model servers (LM
-    Studio, Ollama, ...) can each host a different subset of the three
-    roles (generation/router/judge) -- this is what lets the router and
-    judge run on Ollama (serving Qwen) while generation stays on LM
-    Studio (serving Jais), without every call site needing to know or
-    care which backend a given model actually lives on.
-    Falls back to LM Studio's URL for any model not explicitly mapped,
-    which keeps this backward-compatible with a single-server setup.
-    """
-    return config.MODEL_BASE_URLS.get(model, config.LM_STUDIO_BASE_URL)
+_RETRY_STATUS = {429, 500, 502, 503, 504}
+# Models that rejected reasoning_effort: don't send it to them again.
+_effort_rejected = set()
+
+
+def missing_key_message() -> str:
+    return ("GEMINI_API_KEY is not set. Create a key in Google AI Studio "
+            "(https://aistudio.google.com/apikey) and set it in this terminal, e.g. "
+            "PowerShell:  $env:GEMINI_API_KEY = \"your-key\"")
 
 
 def call_completion(messages: list, max_tokens: int, temperature: float,
                     stage: str, model: str = None, timeout: int = 180) -> dict:
-    """Call whichever local OpenAI-compatible server hosts `model` and
-    track this LLM call."""
+    """Call the Gemini API (OpenAI-compatible endpoint) and track this LLM
+    call: tokens, USD cost (thinking tokens included) and latency, retries
+    included."""
     model = model or config.GENERATION_MODEL
-    base_url = _base_url_for(model)
+    if not config.GEMINI_API_KEY:
+        raise RuntimeError(missing_key_message())
+
+    payload = {
+        "model": model,
+        "messages": messages,
+        # max_tokens also covers thinking tokens on Gemini; add headroom so
+        # thinking can't leave the visible answer empty/truncated.
+        "max_tokens": max_tokens + config.THINKING_TOKEN_HEADROOM,
+        "temperature": temperature,
+    }
+    effort = config.REASONING_EFFORT.get(stage, config.DEFAULT_REASONING_EFFORT)
+    if effort and model not in _effort_rejected:
+        payload["reasoning_effort"] = effort
+
+    url = f"{config.GEMINI_BASE_URL}/chat/completions"
+    headers = {"Authorization": f"Bearer {config.GEMINI_API_KEY}",
+               "Content-Type": "application/json"}
+
     start = time.perf_counter()
-    try:
-        response = requests.post(
-            f"{base_url}/chat/completions",
-            json={
-                "model": model,
-                "messages": messages,
-                "max_tokens": max_tokens,
-                "temperature": temperature,
-            },
-            timeout=timeout,
-        )
-    except requests.exceptions.RequestException:
-        # Record the failed call (0 tokens, success=False) before letting
-        # the caller's own error handling/fallback take over -- every
-        # attempted LLM call is tracked, whether or not it succeeded.
-        _record_call(stage, model, 0, 0, time.perf_counter() - start, success=False)
-        raise
+    attempt = 0
+    while True:
+        try:
+            response = requests.post(url, headers=headers, json=payload, timeout=timeout)
+        except requests.exceptions.RequestException:
+            if attempt < config.MAX_RETRIES:
+                time.sleep(config.RETRY_BACKOFF_SECONDS * (2 ** attempt))
+                attempt += 1
+                continue
+            # Record the failed call (0 tokens, success=False) before letting
+            # the caller's own error handling/fallback take over.
+            _record_call(stage, model, 0, 0, time.perf_counter() - start, success=False)
+            raise
+
+        if (response.status_code == 400 and "reasoning_effort" in payload
+                and any(w in response.text.lower() for w in ("reasoning", "thinking"))):
+            # This model doesn't accept that effort level: drop it and retry.
+            _effort_rejected.add(model)
+            payload.pop("reasoning_effort")
+            continue
+        if response.status_code in _RETRY_STATUS and attempt < config.MAX_RETRIES:
+            time.sleep(config.RETRY_BACKOFF_SECONDS * (2 ** attempt))
+            attempt += 1
+            continue
+        break
 
     latency_seconds = time.perf_counter() - start
     if not response.ok:
         detail = response.text.strip()
         _record_call(stage, model, 0, 0, latency_seconds, success=False)
         raise RuntimeError(
-            f"The server at {base_url} rejected the {stage} request with HTTP "
+            f"The Gemini API rejected the {stage} request with HTTP "
             f"{response.status_code} for model {model!r}. Server response: {detail[:1000]}"
         )
+
     data = response.json()
-    content = data["choices"][0]["message"]["content"].strip()
+    choice = data["choices"][0]
+    content = (choice.get("message", {}).get("content") or "").strip()
+    if not content:
+        print(f"WARNING: empty {stage} response from {model} "
+              f"(finish_reason={choice.get('finish_reason')!r}).", file=sys.stderr)
+
     usage = data.get("usage") or {}
-    reported_input = usage.get("prompt_tokens")
-    reported_output = usage.get("completion_tokens")
-    input_tokens = reported_input or estimate_tokens(
+    prompt_tokens = usage.get("prompt_tokens")
+    completion_tokens = usage.get("completion_tokens")
+    total_tokens = usage.get("total_tokens")
+    reasoning_tokens = (usage.get("completion_tokens_details") or {}).get("reasoning_tokens")
+
+    input_tokens = prompt_tokens or estimate_tokens(
         "\n".join(str(m.get("content", "")) for m in messages)
     )
-    output_tokens = reported_output or estimate_tokens(content)
-    tokens_estimated = not (reported_input and reported_output)
+    output_tokens = completion_tokens or estimate_tokens(content)
+    if prompt_tokens is not None and total_tokens is not None:
+        # Everything generated beyond the prompt is billed as output,
+        # including thinking tokens even if completion_tokens leaves them out.
+        output_tokens = max(output_tokens, total_tokens - prompt_tokens)
+    tokens_estimated = not (prompt_tokens and completion_tokens)
+
     _record_call(stage, model, input_tokens, output_tokens, latency_seconds,
-                 success=True, tokens_estimated=tokens_estimated)
+                 success=True, tokens_estimated=tokens_estimated,
+                 reasoning_tokens=reasoning_tokens)
     return {
         "data": data,
         "text": content,
@@ -146,6 +198,40 @@ def estimate_tokens(text: str) -> int:
     return max(1, len(text.split()))
 
 
+_SOURCE_WORD = r"(?:المصدر|المصادر|المرجع|المراجع|source|sources|reference|references)"
+_SOURCE_LINE_RE = re.compile(
+    r"^[\s>*_#\-\u2022]*" + _SOURCE_WORD + r"\b\s*[:：،\-]?[^\n]*$", re.IGNORECASE)
+_SOURCE_CUE_RE = re.compile(
+    r"(صفحة|صفحه|page|chunk|مقتطف|معرّف|معرف|مُعرّف|مُعرِّف|مُعَرِّف|\.pdf|::p\d+::c\d+)",
+    re.IGNORECASE)
+_ID_PIECE = r"[A-Za-z0-9 _\-\.]+\.pdf::p\d+::c\d+"
+_ID_ONLY_LINE_RE = re.compile(
+    r"^[\s>*_\-\u2022\[\(]*" + _ID_PIECE + r"(?:[\s\]\)\.،,و]+" + _ID_PIECE + r")*[\s\]\)\.،,]*$")
+_INLINE_ID_RE = re.compile(
+    r"\s*[\[\(]\s*(?:chunk id\s*[:：]\s*)?[^\[\]\(\)\n]*?\.pdf::p\d+::c\d+[^\[\]\(\)\n]*[\]\)]",
+    re.IGNORECASE)
+
+
+def strip_inline_sources(text: str) -> str:
+    """Safety net: remove 'Source: page N, Chunk ID: ...' lines (and bare chunk-id
+    lines / bracketed ids) from an answer. Sources are shown in the UI's separate
+    Sources section, so they must not appear inside the answer text. A line is
+    only dropped when it STARTS with a source word AND carries a page/chunk cue,
+    so ordinary sentences that happen to begin with 'المصدر' are kept."""
+    if not text:
+        return text
+    kept = []
+    for line in text.splitlines():
+        if _SOURCE_LINE_RE.match(line) and _SOURCE_CUE_RE.search(line):
+            continue
+        if _ID_ONLY_LINE_RE.match(line):
+            continue
+        kept.append(_INLINE_ID_RE.sub("", line))
+    cleaned = "\n".join(kept)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
 def build_grounded_prompt(question: str, hits: list) -> str:
     """
     The RAG-route final prompt. Requirements this MUST keep enforcing,
@@ -154,7 +240,8 @@ def build_grounded_prompt(question: str, hits: list) -> str:
       - answer the user's actual question
       - never invent facts not supported by the context
       - explicitly say so if the context can't fully support an answer
-      - surface source/chunk identifiers when available
+      - NOT print source/chunk identifiers inside the answer text (the UI shows them
+        in a separate Sources section; strip_inline_sources() removes any that slip through)
     """
     context_blocks = []
     for h in hits:
@@ -177,7 +264,7 @@ def build_grounded_prompt(question: str, hits: list) -> str:
 - إذا كان المحتوى يصف إجراءً أو خطوات، اذكر كل خطوة مرقّمة بالترتيب، مع التفاصيل المهمة (من المسؤول، ما هي النماذج أو السجلات المطلوبة، التوقيت). لا تلخص في جملة واحدة قصيرة.
 - السياق أدناه هو المقتطفات المسترجعة فعلياً من الوثائق فقط -- لا تعتبر أي إعادة صياغة للسؤال أو فقرة افتراضية أو استعلامات بحث مولّدة دليلاً على الإطلاق.
 - إذا تعارضت المصادر المسترجعة مع بعضها البعض، اذكر هذا التعارض بوضوح في إجابتك بدلاً من اختيار جانب واحد بصمت.
-- في نهاية الإجابة، اذكر معرّف المقتطف/رقم الصفحة المصدر (مثال: المصدر: صفحة 8، Chunk ID: ...)."""
+- لا تذكر في إجابتك معرّف المقتطف ولا رقم الصفحة ولا اسم الملف ولا سطر "المصدر"؛ تُعرض المصادر تلقائياً في قسم منفصل أسفل الإجابة."""
     else:
         instruction = """Using ONLY the context excerpts below, give a complete, detailed \
     answer to the question. Treat the context as the complete source of truth: do not use \
@@ -191,8 +278,8 @@ def build_grounded_prompt(question: str, hits: list) -> str:
     The context below consists only of passages actually retrieved from the documents -- never \
     treat a query rewrite, a hypothetical passage, or a generated search query as evidence. If the \
     retrieved sources disagree with each other, clearly point out the disagreement instead of \
-    silently picking one side. At the end, mention the source chunk id(s) and page number(s) the \
-    answer was drawn from."""
+    silently picking one side. Do not mention chunk ids, page numbers, file names, or a "Source" \
+    line in the answer; the sources are displayed separately below the answer."""
 
     return f"""{instruction}
 
@@ -271,10 +358,6 @@ def call_llm(prompt: str, arabic: bool, system_message: str = None,
 
 def connection_error_message() -> str:
     return (
-        "Couldn't reach a local model server. This pipeline can call more than "
-        "one: make sure LM Studio is open with config.LM_STUDIO_MODEL loaded and "
-        "its Local Server started (Developer tab -> Start Server) for "
-        "generation, AND, if config.ROUTER_MODEL/config.JUDGE_MODEL are mapped "
-        "to Ollama in config.MODEL_BASE_URLS, that `ollama serve` is running and "
-        "those models have been pulled (`ollama pull <model>`)."
+        "Couldn't reach the Gemini API. Check your internet connection or proxy, "
+        "and that GEMINI_API_KEY is set and valid."
     )
