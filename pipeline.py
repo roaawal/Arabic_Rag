@@ -15,8 +15,6 @@ import router
 import rag
 import advanced_rag
 import evaluate
-import reference_lookup
-from logging_utils import append_record
 
 
 def _answer_direct(question: str) -> dict:
@@ -31,10 +29,7 @@ def _answer_direct(question: str) -> dict:
 
     input_tokens = result["input_tokens"]
     output_tokens = result["output_tokens"]
-    cost = (
-        (input_tokens / 1000) * config.COST_PER_1K_INPUT_TOKENS
-        + (output_tokens / 1000) * config.COST_PER_1K_OUTPUT_TOKENS
-    )
+    cost = generation.compute_cost(config.GENERATION_MODEL, input_tokens, output_tokens)
     return {
         "record_id": str(uuid.uuid4()),
         "approach": "direct",
@@ -66,6 +61,19 @@ def _print_router_decision(decision: dict):
     print(f"reason={decision['reason']}")
 
 
+def format_cost_time(record: dict) -> str:
+    """Per-question cost and wall-clock time, split into answering vs.
+    LLM-as-judge evaluation (the judge call adds cost and waiting time on
+    top of the answer itself)."""
+    def row(label, cost, seconds):
+        return f"{label:<11} ${cost:.6f}   {seconds:.2f}s"
+    return "\n".join([
+        row("Answer", record.get("answer_cost", 0.0), record.get("answer_seconds", 0.0)),
+        row("Evaluation", record.get("evaluation_cost", 0.0), record.get("evaluation_seconds", 0.0)),
+        row("TOTAL", record.get("total_cost", 0.0), record.get("total_latency_seconds", 0.0)),
+    ])
+
+
 def _print_summary(evaluated: dict):
     print(
         f"\n[evaluation]\n"
@@ -75,15 +83,13 @@ def _print_summary(evaluated: dict):
         f"correctness={evaluated.get('correctness')}"
     )
     print(
-        f"\n[cost]\n"
-        f"total_input_tokens={evaluated.get('total_input_tokens')}\n"
-        f"total_output_tokens={evaluated.get('total_output_tokens')}\n"
-        f"total_cost={evaluated.get('total_cost')}\n"
-        f"total_latency_ms={evaluated.get('total_latency_ms')}"
+        f"\n[cost & time]  (tokens in/out: {evaluated.get('total_input_tokens')}"
+        f"/{evaluated.get('total_output_tokens')}, thinking included)\n"
+        + format_cost_time(evaluated)
     )
 
 
-def answer(question: str, top_k: int = None, log: bool = True, verbose: bool = True,
+def answer(question: str, top_k: int = None, verbose: bool = True,
            reference: str = None) -> dict:
     """
     Routes and answers one question end to end. Always returns a record
@@ -96,14 +102,9 @@ def answer(question: str, top_k: int = None, log: bool = True, verbose: bool = T
 
     `reference` is an optional ground-truth answer to score `correctness`
     against. If omitted (the normal case -- chat.py never passes one),
-    reference_lookup.find_reference() checks `question` against
-    reference_answers.json's known evaluation questions and uses that
-    match's answer if found -- so asking one of those questions verbatim
-    (or with minor copy/paste differences) gets a real correctness score
-    instead of the usual None, with no extra plumbing needed at the
-    call site. Pass `reference` explicitly to override/skip the lookup.
+    correctness stays None.
     """
-    question_id = str(uuid.uuid4())
+    question_start = time.perf_counter()
     tracking_token = generation.start_call_tracking()
     decision = router.classify_route(question)
     route = decision["route"]
@@ -128,40 +129,30 @@ def answer(question: str, top_k: int = None, log: bool = True, verbose: bool = T
         {"num_candidates": len(record.get("chunk_ids", [])), "num_after_reranking": None, "num_after_compression": None},
     )
 
-    if reference is None:
-        reference = reference_lookup.find_reference(question)
-
     # evaluate.py scores Direct/Basic/Advanced identically -- one fixed
-    # rubric, applied every time, regardless of route. `reference` (explicit
-    # or auto-matched above) is what lets `correctness` be scored instead of
-    # staying None -- evaluate_record() already handles reference=None
-    # gracefully, so this is a no-op for any question with no known reference.
-    evaluated = evaluate.evaluate_record(record, reference=reference, log=False)
+    # rubric, applied every time, regardless of route. `reference`, when
+    # passed explicitly, is what lets `correctness` be scored instead of
+    # staying None -- evaluate_record() handles reference=None gracefully.
+    answer_seconds = time.perf_counter() - question_start
+    evaluated = evaluate.evaluate_record(record, reference=reference)
+    total_seconds = time.perf_counter() - question_start
     calls = generation.stop_call_tracking(tracking_token)
     evaluated["llm_calls"] = calls
     evaluated["total_input_tokens"] = sum(c["input_tokens"] for c in calls)
     evaluated["total_output_tokens"] = sum(c["output_tokens"] for c in calls)
     evaluated["total_cost"] = sum(c["cost"] for c in calls)
-    evaluated["total_latency_seconds"] = sum(c["latency_seconds"] for c in calls)
-    evaluated["total_latency_ms"] = evaluated["total_latency_seconds"] * 1000
+    evaluated["answer_cost"] = sum(c["cost"] for c in calls if c["stage"] != "evaluation_judge")
+    evaluated["evaluation_cost"] = sum(c["cost"] for c in calls if c["stage"] == "evaluation_judge")
+    # Wall-clock time the person actually waited (retrieval, reranking and
+    # every API call included), not just the sum of API latencies.
+    evaluated["answer_seconds"] = answer_seconds
+    evaluated["evaluation_seconds"] = total_seconds - answer_seconds
+    evaluated["total_latency_seconds"] = total_seconds
+    evaluated["total_latency_ms"] = total_seconds * 1000
+    evaluated["llm_latency_seconds"] = sum(c["latency_seconds"] for c in calls)
     evaluated["executed_path"] = [c["stage"] for c in calls]
-
-    # Structured record shape for downstream consumers/logging (question_id,
-    # nested router_decision/retrieval/evaluation) -- kept alongside the
-    # existing flat fields above so nothing already reading them breaks.
-    evaluated["question_id"] = question_id
-    evaluated["retrieval"] = evaluated.get("retrieval_stats")
-    evaluated["evaluation"] = {
-        "context_relevance": evaluated.get("context_relevance"),
-        "faithfulness": evaluated.get("faithfulness"),
-        "answer_relevance": evaluated.get("answer_relevance"),
-        "correctness": evaluated.get("correctness"),
-    }
 
     if verbose:
         _print_summary(evaluated)
-
-    if log:
-        append_record(config.EVAL_LOG, evaluated)
 
     return evaluated

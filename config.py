@@ -2,7 +2,19 @@
 Central configuration for the Arabic-friendly RAG pipeline.
 Tweak these values instead of hunting through the other files.
 """
+import datetime
 import os
+
+# --- OCR (Gemini vision; see ocr_backends.py) ---
+OCR_GEMINI_MODEL = "fast"   # "fast" = GEMINI_FAST_MODEL below
+OCR_DPI = 200
+OCR_STRIP_MARKDOWN = True
+OCR_CACHE_DIR = os.path.join(os.path.dirname(__file__), "ocr_cache")
+try:
+    from dotenv import load_dotenv
+    load_dotenv()          # reads .env from the project folder
+except ImportError:
+    pass
 
 # --- Paths ---
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
@@ -26,7 +38,7 @@ COLLECTION_NAME = "arabic_pdf_docs"
 # BM25 catches exact term overlap, dense catches paraphrases/synonyms.
 # Combining both via RRF improves recall for this kind of document.
 # No re-indexing required: BM25 is built from the same chunk text
-# already stored in Chroma by build_index.py.
+# already stored in Chroma by ingestion.py.
 USE_HYBRID_RETRIEVAL = True
 HYBRID_CANDIDATE_POOL = 20   # candidates each method contributes before fusion
 RRF_K = 60                   # standard reciprocal-rank-fusion constant
@@ -36,7 +48,7 @@ RRF_K = 60                   # standard reciprocal-rank-fusion constant
 # an identical version/logo table (رقم النسخة / تاريخ الإصدار / اسم
 # الاجراء ...) as extracted TEXT on every single page. Left alone, that
 # boilerplate gets embedded into every chunk and dilutes both BM25 and
-# dense similarity (every chunk starts to look alike). pdf_loader.py
+# dense similarity (every chunk starts to look alike). ingestion.py
 # detects any line that repeats on at least this fraction of a document's
 # pages and strips it before chunking. 0.5 caught 14/15 pages of the
 # sample manual's header without touching real content (which naturally
@@ -49,130 +61,121 @@ HEADER_FOOTER_MIN_REPEAT_RATIO = 0.5
 # image -- all three agree) have common short Arabic words (من، على،
 # التي) missing letters directly in the document's rendered glyphs, not
 # as an extraction-tool bug. No extraction method fixes this -- it's
-# baked into the source file. build_index.py can only flag it, not
+# baked into the source file. ingestion.py can only flag it, not
 # repair it: if you can get a cleaner re-export of the original file,
 # do that; otherwise this is a known, accepted limitation (it mainly
 # hits short connective words, not the domain nouns you actually search
 # and retrieve on).
 # If the ratio of "broken-looking" to "well-formed" instances of a set
-# of common function words exceeds this, build_index.py prints a
+# of common function words exceeds this, ingestion.py prints a
 # warning naming the affected source file.
 TEXT_CORRUPTION_WARN_RATIO = 0.3
 
-# Threshold for the SEPARATE mixed-script corruption check (see
-# pdf_loader.estimate_mixed_script_corruption's docstring) -- a different
-# corruption pattern (individual letters silently swapped for foreign-
-# script codepoints, anywhere in the text, including domain nouns) that
-# the function-word probe above can miss entirely. Lower threshold than
-# TEXT_CORRUPTION_WARN_RATIO because even a small fraction of domain
-# nouns getting corrupted this way meaningfully hurts retrieval (unlike
-# the function-word pattern, which mostly hits connective words).
-MIXED_SCRIPT_WARN_RATIO = 0.05
+# --- LLM backend: Google Gemini API (OpenAI-compatible endpoint) ---
+# Every LLM call (router, helper stages, generation, judge) goes to the
+# Gemini API. Set your key in the environment before running:
+#   PowerShell:  $env:GEMINI_API_KEY = "your-key"
+# Use a PAID-tier key for internal documents: on the free tier Google may
+# use prompts and responses to improve its products; on the paid tier it
+# does not (https://ai.google.dev/gemini-api/terms).
+GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai"
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
 
-# --- Generation: via LM Studio's local server ---
-# Given this machine's actual hardware (RTX 3050, 4GB VRAM; 16GB system
-# RAM), running a model directly in Python (via transformers or raw
-# llama-cpp-python) kept hitting memory/allocation walls. LM Studio
-# already handles GGUF downloads and automatic GPU/CPU memory splitting
-# far more robustly, and exposes a local OpenAI-compatible HTTP server --
-# so generation now just calls that server instead of loading a model
-# in this process at all.
-#
-# NOTE ON MODEL CHOICE: jais-family-2p7b-chat was tried first for its
-# native Arabic tuning, but Jais uses a custom architecture (ALiBi
-# position encoding instead of RoPE) that is NOT one of llama.cpp's
-# core first-class architectures the way Llama/Qwen/Gemma/Mistral are.
-# GGUF builds of it are community-converted, and mismatches between the
-# GGUF and whatever llama.cpp build LM Studio ships tend to surface as
-# load failures or crashes. Jais's context window is also a hard 2,048
-# tokens (the length it was actually trained on), which is what caused
-# the "request (6100 tokens) exceeds the available context size (2048
-# tokens)" HTTP 400 -- a handful of retrieved chunks plus the grounding
-# instructions routinely blew past that.
-#
-# Switched generation to Qwen2.5-3B-Instruct
-# (lmstudio-community/Qwen2.5-3B-Instruct-GGUF): mainstream/well-
-# supported architecture, strong Arabic capability in practice, and a
-# 32k context window -- more than enough headroom for this pipeline's
-# prompts that no pre-flight token budgeting/trimming is needed.
-LM_STUDIO_BASE_URL = "http://localhost:1234/v1"
-LM_STUDIO_MODEL = "qwen2.5-3b-instruct"  # main answer-generation model -- lmstudio-community/Qwen2.5-3B-Instruct-GGUF, 32k context
-# If you want the router and judge to use different models than the
-# answer-generation model, load those model names in LM Studio and set
-# the values below to match exactly.
-# LM_STUDIO_MODEL = "jais-family-2p7b-chat"    # Arabic-native alternative -- NOTE: hard 2,048-token context, see above
-# LM_STUDIO_MODEL = "qwen2.5-7b-instruct"      # heavier generation model
+# --- Model choice per role (prices checked 2026-10-20, see MODEL_PRICING) ---
+# Router + helper stages: cheap, fast Flash-Lite tier. These are short
+# classification/JSON/scoring calls, so a bigger model buys little.
+GEMINI_FAST_MODEL = "gemini-3.5-flash-lite"
+# Final answer + judge: Flash tier. gemini-3.8-flash is Google's newest
+# Flash and costs the same as gemini-3.6-flash, so there is no reason to
+# pick the older one. Pro/Argon models cost 2.7x+ more per token and
+# always think, which makes every question slower and pricier.
+GEMINI_MAIN_MODEL = "gemini-3.8-flash"
 
-# --- Ollama (used for router + judge, since only Jais is loaded in LM
-# Studio and LM Studio only serves one loaded model at a time) ---
-# Ollama exposes the same OpenAI-compatible /v1/chat/completions shape LM
-# Studio does, just on its own port, so it can run alongside LM Studio
-# without the two fighting over the same model slot. Install Ollama, run
-# `ollama pull qwen2.5:3b` and `ollama pull qwen2.5:7b` (Ollama serves
-# Qwen2.5 directly -- no separate GGUF hunting needed), and `ollama serve`
-# should already be running in the background after install (it installs
-# as a background service on most platforms; run it manually if not).
-OLLAMA_BASE_URL = "http://localhost:11434/v1"
+GENERATION_MODEL = GEMINI_MAIN_MODEL     # final grounded/direct answer
+ROUTER_MODEL = GEMINI_FAST_MODEL         # route classification
+REWRITER_MODEL = GEMINI_FAST_MODEL       # query rewriting
+MULTI_QUERY_MODEL = GEMINI_FAST_MODEL    # multi-query generation
+DECOMPOSITION_MODEL = GEMINI_FAST_MODEL  # question decomposition
+HYDE_MODEL = GEMINI_FAST_MODEL           # hypothetical-document generation
+RERANKER_MODEL = GEMINI_FAST_MODEL       # LLM-based reranking
+COMPRESSION_MODEL = GEMINI_FAST_MODEL    # contextual compression
+CRAG_MODEL = GEMINI_FAST_MODEL           # CRAG relevance grading
+JUDGE_MODEL = GEMINI_MAIN_MODEL          # LLM-as-judge evaluation
 
-# Maps each model name to the server that actually hosts it.
-# generation.call_completion() looks a model up here to decide which
-# server to call; any model NOT listed here falls back to
-# LM_STUDIO_BASE_URL, so this only needs entries for models living
-# somewhere other than the default LM Studio server.
-MODEL_BASE_URLS = {
-    "qwen2.5:3b": OLLAMA_BASE_URL,
-    "qwen2.5:7b": OLLAMA_BASE_URL,
-}
-
-MAX_NEW_TOKENS = 800
+MAX_NEW_TOKENS = 2048
 TEMPERATURE = 0.2
 
-# --- Per-stage model configuration ---
-# Every LLM-driven stage of the pipeline gets its OWN configured model
-# name instead of hardcoding one everywhere. All of them default to
-# LM_STUDIO_MODEL (the only model actually loaded in LM Studio in the
-# current single-GPU setup), so existing behavior is unchanged out of
-# the box -- but each can be pointed at a different model (e.g. one of
-# the Ollama-hosted Qwen models, or a future dedicated reranker/judge
-# model) independently, and generation.call_completion() already knows
-# how to route any model name to the right server via
-# config.MODEL_BASE_URLS.
-GENERATION_MODEL = LM_STUDIO_MODEL      # final grounded/direct answer
-REWRITER_MODEL = LM_STUDIO_MODEL        # query rewriting
-MULTI_QUERY_MODEL = LM_STUDIO_MODEL     # multi-query generation
-DECOMPOSITION_MODEL = LM_STUDIO_MODEL   # question decomposition
-HYDE_MODEL = LM_STUDIO_MODEL            # hypothetical-document generation
-RERANKER_MODEL = LM_STUDIO_MODEL        # LLM-based reranking
-COMPRESSION_MODEL = LM_STUDIO_MODEL     # contextual compression
-CRAG_MODEL = LM_STUDIO_MODEL            # CRAG relevance grading
+# --- Thinking control ---
+# Gemini 3 models always think, and thinking tokens are billed as output
+# tokens. Lower effort = cheaper and faster. Per-stage override by stage
+# name (the names used in generation.call_completion); anything not listed
+# uses DEFAULT_REASONING_EFFORT. Valid: "minimal", "low", "medium", "high".
+DEFAULT_REASONING_EFFORT = "low"
+REASONING_EFFORT = {
+    "router": "minimal",
+    "rewriter": "minimal",
+    "multi_query": "minimal",
+    "decomposition": "minimal",
+    "hyde": "minimal",
+    "reranking": "minimal",
+    "contextual_compression": "minimal",
+    "crag_evaluator": "minimal",
+    "direct_generation": "low",
+    "final_generation": "low",
+    "evaluation_judge": "low",
+}
+# max_tokens on the Gemini API also covers thinking tokens. This headroom
+# is ADDED to every call's max_tokens so thinking can't squeeze the visible
+# answer to nothing. You only pay for tokens actually generated.
+THINKING_TOKEN_HEADROOM = 1024
+
+# Retries for transient API errors (rate limit 429, server 5xx).
+MAX_RETRIES = 3
+RETRY_BACKOFF_SECONDS = 2.0
 
 # --- Cost tracking ---
-# Running fully locally via LM Studio costs $0 per token -- these are 0
-# by default. Set them if you want to compare this pipeline's token
-# usage against a paid API on an apples-to-apples cost basis (e.g. to
-# answer "what would this have cost on a hosted model").
-COST_PER_1K_INPUT_TOKENS = 0.0
-COST_PER_1K_OUTPUT_TOKENS = 0.0
+# Standard paid-tier prices in USD per 1M tokens, from
+# https://ai.google.dev/gemini-api/docs/pricing (checked 2026-10-20).
+# Each entry is a list of (last_day_inclusive_ISO_date_or_None, input,
+# output) rows; the first row whose date has not passed applies, so
+# announced price changes take effect automatically on the right day.
+# Output price includes thinking tokens. Update this table when Google
+# changes prices or you switch models.
+MODEL_PRICING = {
+    # Flash-Lite tier (flat price)
+    "gemini-3.1-flash-lite": [(None, 0.25, 1.50)],
+    "gemini-3.5-flash-lite": [(None, 0.30, 2.50)],
+    # Flash tier: introductory price until 2026-12-31, doubles on 2027-01-01
+    "gemini-3.6-flash": [("2026-12-31", 0.75, 3.75), (None, 1.50, 7.50)],
+    "gemini-3.8-flash": [("2026-12-31", 0.75, 3.75), (None, 1.50, 7.50)],
+    # Pro / flagship (prompts up to 200k tokens; this pipeline stays far below)
+    "gemini-3.1-pro-preview": [(None, 2.00, 12.00)],
+    "gemini-4-argon": [("2026-11-30", 2.00, 10.00), (None, 4.00, 20.00)],
+}
 
-# --- Logging (per-question records for basic_rag.py / evaluate.py) ---
-LOGS_DIR = os.path.join(os.path.dirname(__file__), "logs")
-BASIC_RAG_LOG = os.path.join(LOGS_DIR, "basic_rag_runs.jsonl")
-EVAL_LOG = os.path.join(LOGS_DIR, "eval_runs.jsonl")
+
+def price_per_million(model: str, on: datetime.date = None):
+    """(input_usd, output_usd) per 1M tokens for `model` on date `on`
+    (default: today), or None if the model has no entry in MODEL_PRICING."""
+    rows = MODEL_PRICING.get(model)
+    if not rows:
+        return None
+    on = on or datetime.date.today()
+    for last_day, price_in, price_out in rows:
+        if last_day is None or on <= datetime.date.fromisoformat(last_day):
+            return price_in, price_out
+    return rows[-1][1], rows[-1][2]
+
 
 # --- LLM-as-judge evaluation ---
-# Which model answers the judge prompts. Runs on Ollama (see
-# MODEL_BASE_URLS above) so it's independent from both the generation
-# model (Jais, on LM Studio) and doesn't need a second model loaded
-# alongside Jais in LM Studio's single model slot.
-JUDGE_MODEL = "qwen2.5:7b"
-JUDGE_MAX_NEW_TOKENS = 400
+# Which model answers the judge prompts: see JUDGE_MODEL above.
+JUDGE_MAX_NEW_TOKENS = 1024
 JUDGE_TEMPERATURE = 0.0  # deterministic scoring, not creative generation
 
 # --- Router ---
 # Classifies each incoming question into a route BEFORE any retrieval
-# happens. Also runs on Ollama, for the same reason as JUDGE_MODEL above.
-ROUTER_MODEL = "qwen2.5:3b"
-ROUTER_MAX_NEW_TOKENS = 300
+# happens. Model: see ROUTER_MODEL above.
+ROUTER_MAX_NEW_TOKENS = 512
 ROUTER_TEMPERATURE = 0.0
 VALID_ROUTES = {"direct", "rag", "advanced_rag"}
 # The router only ever SELECTS from these four query-understanding
