@@ -188,6 +188,12 @@ def hyde_answer(question: str) -> str:
 # Self-Query (metadata extraction)
 # ---------------------------------------------------------------------------
 _PAGE_PATTERN = re.compile(r"(?:page|صفحة)\s*(\d{1,3})", re.IGNORECASE)
+# A manual named in Arabic ("في دليل الإنذار المركزي") -> source-file prefix.
+_MANUAL_PATTERNS = {
+    "Central Alarm": re.compile(r"دليل\s+(?:\S+\s+){0,2}?(?:ال)?[إا]نذار"),
+    "Central Mail": re.compile(r"دليل\s+(?:\S+\s+){0,2}?(?:ال)?بريد"),
+    "Assets": re.compile(r"دليل\s+(?:\S+\s+){0,2}?(?:ال)?(?:موجودات|مستودعات)"),
+}
 
 
 def self_query(question: str) -> tuple:
@@ -227,6 +233,19 @@ def self_query(question: str) -> tuple:
         if matched_source:
             where_clauses.append({"source": matched_source})
             cleaned = cleaned.replace(mentioned, "").strip()
+
+    # A manual named in Arabic. Only one may match: a question naming two
+    # manuals needs both, so it must not be narrowed to either.
+    if not pdf_match:
+        named = [p for p, pattern in _MANUAL_PATTERNS.items() if pattern.search(question)]
+        if len(named) == 1:
+            try:
+                known_sources = rag.get_known_metadata_values()["sources"]
+            except Exception:
+                known_sources = []
+            matched_source = next((s for s in known_sources if s.startswith(named[0])), None)
+            if matched_source:
+                where_clauses.append({"source": matched_source})
 
     # Section-name matching: a crude but safe containment check -- if a
     # meaningful chunk of a KNOWN section heading's words appear in the

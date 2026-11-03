@@ -29,7 +29,7 @@ def _answer_direct(question: str) -> dict:
 
     input_tokens = result["input_tokens"]
     output_tokens = result["output_tokens"]
-    cost = generation.compute_cost(config.GENERATION_MODEL, input_tokens, output_tokens)
+    cost = generation.compute_cost(result["model"], input_tokens, output_tokens)
     return {
         "record_id": str(uuid.uuid4()),
         "approach": "direct",
@@ -43,8 +43,37 @@ def _answer_direct(question: str) -> dict:
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "cost": cost,
+        "generation_model": result["model"],
         "latency_seconds": result["latency_seconds"],
         "total_latency_seconds": time.perf_counter() - total_start,
+    }
+
+
+def _answer_clarify(question: str):
+    """Asks which procedure is meant, offering procedures retrieval actually
+    found. Returns None when the question isn't ambiguous after all, so the
+    caller can answer it normally."""
+    total_start = time.perf_counter()
+    hits = rag.retrieve(question, top_k=config.CLARIFY_POOL)
+    message = generation.build_clarification(question, hits)
+    if message is None:
+        return None
+    seconds = time.perf_counter() - total_start
+    return {
+        "record_id": str(uuid.uuid4()),
+        "approach": "clarify",
+        "question": question,
+        "executed_steps": ["router", "retrieval"],
+        "retrieval_stats": {"num_candidates": len(hits), "num_after_reranking": None, "num_after_compression": None},
+        "chunk_ids": [],
+        "retrieved_chunks": [],
+        "context": "",
+        "answer": message,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cost": 0.0,
+        "latency_seconds": 0.0,
+        "total_latency_seconds": seconds,
     }
 
 
@@ -57,6 +86,7 @@ def _print_router_decision(decision: dict):
     print(f"multiple_search_perspectives={decision['multiple_search_perspectives']}")
     print(f"has_metadata_constraints={decision['has_metadata_constraints']}")
     print(f"is_vague_or_conversational={decision['is_vague_or_conversational']}")
+    print(f"needs_clarification={decision['needs_clarification']}")
     print(f"techniques={decision['techniques']}")
     print(f"reason={decision['reason']}")
 
@@ -101,8 +131,8 @@ def answer(question: str, top_k: int = None, verbose: bool = True,
     is what lets evaluate.py score every route the same way.
 
     `reference` is an optional ground-truth answer to score `correctness`
-    against. If omitted (the normal case -- chat.py never passes one),
-    correctness stays None.
+    against. The LLM judge runs only when one is passed or when
+    config.EVALUATE_EVERY_ANSWER is True; otherwise every score stays None.
     """
     question_start = time.perf_counter()
     tracking_token = generation.start_call_tracking()
@@ -112,7 +142,15 @@ def answer(question: str, top_k: int = None, verbose: bool = True,
     if verbose:
         _print_router_decision(decision)
 
-    if route == "direct":
+    record = None
+    if route == "clarify":
+        record = _answer_clarify(question)
+        if record is None:
+            route = "rag"
+
+    if record is not None:
+        pass
+    elif route == "direct":
         record = _answer_direct(question)
     elif route == "advanced_rag":
         record = advanced_rag.answer_advanced(question, decision, top_k=top_k)
@@ -130,11 +168,16 @@ def answer(question: str, top_k: int = None, verbose: bool = True,
     )
 
     # evaluate.py scores Direct/Basic/Advanced identically -- one fixed
-    # rubric, applied every time, regardless of route. `reference`, when
-    # passed explicitly, is what lets `correctness` be scored instead of
-    # staying None -- evaluate_record() handles reference=None gracefully.
+    # rubric, regardless of route. `reference`, when passed explicitly, is what
+    # lets `correctness` be scored instead of staying None.
     answer_seconds = time.perf_counter() - question_start
-    evaluated = evaluate.evaluate_record(record, reference=reference)
+    if reference or config.EVALUATE_EVERY_ANSWER:
+        evaluated = evaluate.evaluate_record(record, reference=reference)
+    else:
+        evaluated = {
+            **record, "context_relevance": None, "faithfulness": None,
+            "answer_relevance": None, "correctness": None, "judge_notes": None,
+        }
     total_seconds = time.perf_counter() - question_start
     calls = generation.stop_call_tracking(tracking_token)
     evaluated["llm_calls"] = calls

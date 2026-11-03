@@ -8,18 +8,18 @@ Run once, and again any time the PDFs in data/ change:
 Stages (all in this file):
   1. Extract   -- Gemini vision OCR of each page image (ocr_backends.py),
                   cached in ocr_cache/.
-  2. Clean     -- strip running headers/footers repeated across a document's
-                  pages, and warn if the source text looks corrupted.
-  3. Sections  -- detect headings from each document's table of contents and
-                  tag every page with the section it falls under.
-  4. Chunk     -- Arabic-aware sentence packing with overlap; table-of-contents
-                  chunks are skipped.
+  2. Check     -- warn if the source text looks corrupted. The OCR prompt
+                  already skips running headers/footers.
+  3. Structure -- read procedure titles, executing departments, executors and
+                  tables from the OCR Markdown.
+  4. Chunk     -- pack lines within one procedure on one page, repeating the
+                  title, department and executor so no chunk is orphaned.
   5. Index     -- embed with BAAI/bge-m3 and rebuild the Chroma collection.
 """
 import glob
 import os
 import re
-from collections import Counter, defaultdict
+from collections import defaultdict
 
 import config
 
@@ -35,59 +35,8 @@ def extract_pages(pdf_path: str):
 
 
 # ---------------------------------------------------------------------------
-# 2. Cleaning
+# 2. Source-text check
 # ---------------------------------------------------------------------------
-
-
-def strip_repeated_boilerplate(records: list, min_repeat_ratio: float = None) -> list:
-    """
-    Removes lines that repeat across many pages of ONE document (version
-    tables, logos, page footers) so they don't pollute every chunk's
-    embedding and BM25 tokens.
-
-    `records` must be the page records of a single source document. Matching
-    is digit-agnostic, so a header that only changes its page number
-    ("15 /2") is still caught.
-    """
-    if min_repeat_ratio is None:
-        min_repeat_ratio = config.HEADER_FOOTER_MIN_REPEAT_RATIO
-    if len(records) < 3:
-        # Too few pages to tell a repeated header from coincidence.
-        return records
-
-    def normalize(line: str) -> str:
-        line = re.sub(r"\d+", "#", line)
-        return re.sub(r"\s+", " ", line).strip()
-
-    def too_generic(norm: str) -> bool:
-        # A bare page number normalizes to "#"; nearly every page has one, but
-        # it isn't shared boilerplate -- and stripping it would also delete
-        # unrelated numbers (e.g. the per-entry page numbers on the TOC page).
-        # Require at least 3 real characters.
-        return len(re.sub(r"[#\s/\-.]", "", norm)) < 3
-
-    per_page_lines = [rec["text"].split("\n") for rec in records]
-    line_page_counts = Counter()
-    for lines in per_page_lines:
-        line_page_counts.update({normalize(l) for l in lines if normalize(l)})
-
-    n_pages = len(records)
-    boilerplate = {
-        norm for norm, count in line_page_counts.items()
-        if count / n_pages >= min_repeat_ratio and not too_generic(norm)
-    }
-
-    cleaned = []
-    for rec, lines in zip(records, per_page_lines):
-        new_rec = dict(rec)
-        new_rec["text"] = "\n".join(l for l in lines if normalize(l) not in boilerplate)
-        cleaned.append(new_rec)
-
-    if boilerplate:
-        print(f"  Stripped {len(boilerplate)} repeated header/footer line(s) "
-              f"from {records[0]['source']} "
-              f"(seen on >= {int(min_repeat_ratio * 100)}% of its pages).")
-    return cleaned
 
 
 # Common short Arabic function words paired with the "letters missing" form
@@ -117,8 +66,7 @@ def load_pdfs_from_folder(folder: str) -> list:
     """
     Loads every PDF in `folder` and returns page records:
     {"source": filename, "page": page_num, "text": text}.
-    Boilerplate is stripped per document and corrupted-looking sources are
-    reported with a warning.
+    Corrupted-looking sources are reported with a warning.
     """
     pdf_paths = sorted(glob.glob(os.path.join(folder, "*.pdf")))
     if not pdf_paths:
@@ -136,8 +84,6 @@ def load_pdfs_from_folder(folder: str) -> list:
         ]
         print(f"  -> extracted {len(doc_records)} pages with text")
 
-        doc_records = strip_repeated_boilerplate(doc_records)
-
         score = estimate_text_corruption("\n".join(r["text"] for r in doc_records))
         if score >= config.TEXT_CORRUPTION_WARN_RATIO:
             print(f"  WARNING: {filename} looks like it has corrupted source text "
@@ -151,180 +97,235 @@ def load_pdfs_from_folder(folder: str) -> list:
 
 
 # ---------------------------------------------------------------------------
-# 3. Section detection (table of contents)
+# 3. Structure (OCR Markdown -> lines tagged with their procedure context)
 # ---------------------------------------------------------------------------
-# OCR output keeps LOGICAL order: "<item>. <heading> ....dots.... <page>"
-# (or a Markdown table row "| <item>. <heading> | <page> |").
-_TOC_ENTRY_RE_LOGICAL = re.compile(
-    r"(?<!\d)\d{1,2}[)\]]?\.\s*([^\d|.]{3,150}?)\s*(?:\.{3,}|\u2026+|\|)\s*(\d{1,3})(?!\d)"
-)
-
-
-def extract_toc_sections(records: list) -> list:
-    """
-    Scans ONE document's page records for TOC-style entries and returns an
-    ordered list of (start_page, heading).
-
-    Extraction often splits a visual TOC line across several lines, so
-    whitespace is collapsed to single spaces before matching.
-    """
-    entries = []
-    for rec in records:
-        normalized = re.sub(r"\s+", " ", rec["text"]).strip()
-        # Fix a stray space between an item number and its period/bracket
-        # (RTL extraction artifact): "4 .heading" -> "4.heading".
-        normalized = re.sub(r"(\d)\s+([).\]])", r"\1\2", normalized)
-
-        for m in _TOC_ENTRY_RE_LOGICAL.finditer(normalized):
-            heading, page_str = m.group(1).strip(), m.group(2)
-            if heading and int(page_str) > 0:
-                entries.append((int(page_str), heading))
-
-    # Keep the first entry per page, ordered by page.
-    seen, unique = set(), []
-    for page_num, heading in entries:
-        if page_num not in seen:
-            seen.add(page_num)
-            unique.append((page_num, heading))
-    unique.sort(key=lambda x: x[0])
-
-    if not unique and records:
-        print(f"  NOTE: no table-of-contents entries detected for {records[0]['source']}. "
-              f"Section tagging is disabled for this document (section=None).")
-    return unique
-
-
-def section_for_page(toc_entries: list, page_num: int):
-    """Heading of the last TOC entry starting on or before `page_num`, or None."""
-    current = None
-    for start_page, heading in toc_entries:
-        if start_page > page_num:
-            break
-        current = heading
-    return current
-
-
-def tag_sections(page_records: list) -> list:
-    """Returns page records with a "section" key added, detected per document."""
-    by_source = defaultdict(list)
-    for rec in page_records:
-        by_source[rec["source"]].append(rec)
-
-    tagged = []
-    for source, recs in by_source.items():
-        toc_entries = extract_toc_sections(recs)
-        if toc_entries:
-            print(f"  {source}: found {len(toc_entries)} section heading(s)")
-            for pg, hd in toc_entries:
-                print(f"      page {pg:>3} -> {hd[:70]}")
-        for rec in recs:
-            tagged.append({**rec, "section": section_for_page(toc_entries, rec["page"])})
-    return tagged
-
-
-# ---------------------------------------------------------------------------
-# 4. Chunking
-# ---------------------------------------------------------------------------
-# Sentence enders: Latin . ! ? and Arabic ؟ ۔ , plus newlines.
-_SENTENCE_END_RE = re.compile(r"(?<=[.!?؟۔])\s+|\n+")
-# Dot-leaders ("......... 8") mark table-of-contents pages, not prose.
-_DOT_LEADER_RE = re.compile(r"\.{4,}")
-
-# Procedure tables have a recurring row-label column. PyMuPDF puts the label
-# and its value on separate lines, so a chunk boundary could separate them
-# and leave "المنفذ" with no indication of who. Kept as a short explicit list
-# to avoid gluing unrelated short lines together.
-_ROLE_LABEL_LINES = {
-    "الجهة املنفذة", "الجهة المنفذة",  # "executing department" (with/without PDF artifact)
-    "املنفذ", "المنفذ",                  # "executor"
+_HEADING_RE = re.compile(r"^#\s*(.*)$")
+_SUBHEADING_RE = re.compile(r"^###\s*(.+)$")
+_EXECUTOR_RE = re.compile(r"^##\s*المنفذ\s*:?\s*(.*)$")
+_DEPARTMENT_RE = re.compile(r"^الجهة المنفذة\s*:?\s*(.*)$")
+# The manual's own name, sometimes transcribed as a heading on continuation
+# pages. It must not replace the procedure the page belongs to.
+_DOC_TITLE_RE = re.compile(r"^(دليل|إجراءات عمل وحدة)")
+# Some titles lose their "#" in OCR: a short numbered line opening the page.
+_PLAIN_TITLE_RE = re.compile(r"^\d{1,2}\.\s*.{3,120}:$")
+_GENERAL_HEADINGS = {
+    "مقدمة", "القواعد والأحكام العامة", "الملاحق", "التقارير", "النماذج",
+    "جدول التعديلات", "الموافقات",
 }
-
-
-def _glue_role_labels(text: str) -> str:
-    """Joins a label-only line to the next non-empty line ("label: value")."""
-    lines = text.split("\n")
-    glued, i = [], 0
-    while i < len(lines):
-        stripped = lines[i].strip()
-        if stripped in _ROLE_LABEL_LINES:
-            j = i + 1
-            while j < len(lines) and not lines[j].strip():
-                j += 1
-            if j < len(lines):
-                glued.append(f"{stripped}: {lines[j].strip()}")
-                i = j + 1
-                continue
-        glued.append(lines[i])
-        i += 1
-    return "\n".join(glued)
+_IGNORED_LINES = {"الإجراءات", "الاجراءات", "المحتويات"}
+_TABLE_RULE_RE = re.compile(r"^\s*\|?[\s:|\-]+\|?\s*$")
+# Dot-leaders ("......... 8") mark table-of-contents pages, not content.
+_DOT_LEADER_RE = re.compile(r"\.{4,}")
 
 
 def _looks_like_toc(text: str, min_dot_runs: int = 2) -> bool:
     return len(_DOT_LEADER_RE.findall(text)) >= min_dot_runs
 
 
-def split_sentences(text: str) -> list:
-    text = text.strip()
-    if not text:
-        return []
-    return [p.strip() for p in _SENTENCE_END_RE.split(text) if p and p.strip()]
+def _clean_inline(line: str) -> str:
+    line = re.sub(r"<br\s*/?>", " ", line, flags=re.I)
+    line = re.sub(r"<[^>]+>", " ", line)
+    line = re.sub(r"\*\*|__|`", "", line)
+    return re.sub(r"[ \t]+", " ", line).strip()
 
 
-def chunk_text(text: str, chunk_size: int, overlap: int) -> list:
+def _table_cells(line: str) -> list:
+    return [_clean_inline(c) for c in line.strip().strip("|").split("|")]
+
+
+def _table_row_text(headers: list, cells: list) -> str:
+    """One table row as "column: value" pairs, so a row still says what each
+    value means once it is separated from the table's header."""
+    pairs = []
+    for i, cell in enumerate(cells):
+        if not cell:
+            continue
+        header = headers[i] if i < len(headers) else ""
+        pairs.append(f"{header}: {cell}" if header else cell)
+    return " | ".join(pairs)
+
+
+def _new_context() -> dict:
+    return {"procedure": None, "sub": None, "department": None, "executor": None}
+
+
+def _title_of(ctx: dict):
+    parts = [p for p in (ctx["procedure"], ctx["sub"]) if p]
+    return " - ".join(parts) if parts else None
+
+
+def _open_heading(ctx: dict, heading: str):
+    """Applies a heading to the running context. A numbered title or a general
+    heading ("مقدمة:") starts a new part of the manual; anything else, such as
+    "ثانياً. ...", is a part of the current procedure."""
+    if re.match(r"\d", heading) or heading.rstrip(":").strip() in _GENERAL_HEADINGS:
+        ctx.update(procedure=heading, sub=None)
+    else:
+        ctx["sub"] = heading
+    ctx.update(department=None, executor=None)
+
+
+def parse_page_lines(text: str, ctx: dict) -> list:
     """
-    Packs sentences into ~`chunk_size`-character chunks, carrying `overlap`
-    characters of trailing sentences into the next chunk.
+    One page of OCR Markdown -> content lines, each tagged with the title,
+    department and executor in force at that line. `ctx` is carried from page
+    to page because a procedure usually continues over several pages.
+    Each item is {"text", "title", "department", "executor", "attached"};
+    `attached` marks sub-items and notes that belong to the line above.
     """
-    sentences = split_sentences(_glue_role_labels(text))
-    if not sentences:
-        return []
+    items = []
+    lines = text.split("\n")
+    first_content = True
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        i += 1
+        if not line:
+            continue
+        is_first, first_content = first_content, False
 
-    chunks, current, current_len = [], [], 0
-    for sentence in sentences:
-        if current_len + len(sentence) > chunk_size and current:
-            chunks.append(" ".join(current))
+        if line.startswith("|"):
+            has_header = i < len(lines) and _TABLE_RULE_RE.match(lines[i]) and "-" in lines[i]
+            headers = _table_cells(line) if has_header else []
+            if has_header:
+                i += 1
+            rows = [] if has_header else [_table_cells(line)]
+            while i < len(lines) and lines[i].strip().startswith("|"):
+                if not _TABLE_RULE_RE.match(lines[i]):
+                    rows.append(_table_cells(lines[i]))
+                i += 1
+            if has_header and not rows:
+                rows, headers = [headers], []
+            for cells in rows:
+                row = _table_row_text(headers, cells)
+                if row:
+                    items.append({"text": row, "title": _title_of(ctx),
+                                  "department": ctx["department"],
+                                  "executor": ctx["executor"], "attached": False})
+            continue
 
-            overlap_sentences, overlap_len = [], 0
-            for s in reversed(current):
-                if overlap_len + len(s) > overlap:
+        match = _SUBHEADING_RE.match(line)
+        if match:
+            ctx["sub"] = _clean_inline(match.group(1))
+            continue
+        match = _EXECUTOR_RE.match(line)
+        if match:
+            ctx["executor"] = _clean_inline(match.group(1)) or ctx["executor"]
+            continue
+        match = _HEADING_RE.match(line) if not line.startswith("##") else None
+        if match:
+            heading = _clean_inline(match.group(1))
+            if heading and not _DOC_TITLE_RE.match(heading):
+                _open_heading(ctx, heading)
+            continue
+        match = _DEPARTMENT_RE.match(line)
+        if match:
+            ctx["department"] = _clean_inline(match.group(1)) or ctx["department"]
+            continue
+
+        line = _clean_inline(re.sub(r"^#{1,6}\s*", "", line))
+        bare = line.rstrip(":").strip()
+        if bare in _IGNORED_LINES:
+            continue
+        if bare in _GENERAL_HEADINGS or (is_first and _PLAIN_TITLE_RE.match(line)):
+            _open_heading(ctx, line)
+            continue
+        items.append({
+            "text": line,
+            "title": _title_of(ctx),
+            "department": ctx["department"],
+            "executor": ctx["executor"],
+            "attached": line.startswith(("-", "•", "ملاحظة")),
+        })
+    return items
+
+
+# ---------------------------------------------------------------------------
+# 4. Chunking
+# ---------------------------------------------------------------------------
+
+
+def _render_chunk(group: list) -> str:
+    """Context header, then the lines; a change of executor stays visible."""
+    first = group[0]
+    out = []
+    if first["title"]:
+        out.append(first["title"])
+    if first["department"]:
+        out.append(f"الجهة المنفذة: {first['department']}")
+    executor = first["executor"]
+    if executor:
+        out.append(f"المنفذ: {executor}")
+    for item in group:
+        if item["executor"] != executor and item["executor"]:
+            executor = item["executor"]
+            out.append(f"المنفذ: {executor}")
+        out.append(item["text"])
+    return "\n".join(out)
+
+
+def _pack_lines(items: list, chunk_size: int, overlap: int) -> list:
+    """
+    Packs lines into ~`chunk_size`-character groups with `overlap` characters of
+    trailing lines repeated. An attached line may overflow by half a chunk
+    rather than be separated from the step it belongs to.
+    """
+    groups, current, current_len = [], [], 0
+    for item in items:
+        size = len(item["text"])
+        limit = chunk_size * 1.5 if item["attached"] else chunk_size
+        if current and current_len + size > limit:
+            groups.append(current)
+            kept, kept_len = [], 0
+            for prev in reversed(current):
+                if kept_len + len(prev["text"]) > overlap:
                     break
-                overlap_sentences.insert(0, s)
-                overlap_len += len(s)
-            current, current_len = overlap_sentences, overlap_len
-
-        current.append(sentence)
-        current_len += len(sentence)
-
+                kept.insert(0, prev)
+                kept_len += len(prev["text"])
+            current, current_len = kept, kept_len
+        current.append(item)
+        current_len += size
     if current:
-        chunks.append(" ".join(current))
-    return chunks
+        groups.append(current)
+    return groups
 
 
 def chunk_records(records: list, chunk_size: int, overlap: int) -> list:
     """
-    Page records (with optional "section") -> chunk records
-    {"source", "page", "chunk_id", "section", "text"}.
+    Page records -> chunk records {"source", "page", "chunk_id", "section", "text"}.
 
-    The section heading is prepended to each chunk's text so both the dense
-    embedding and BM25 see the topic. TOC-like chunks are skipped so they
-    never surface as false-positive hits.
+    Chunks never cross a procedure or a page, so a citation always points at the
+    right page, and each chunk repeats its procedure context, so both the dense
+    embedding and BM25 see the topic. Table-of-contents pages are skipped.
     """
     chunked, skipped_toc = [], 0
+    ctx, ctx_source = _new_context(), None
     for rec in records:
-        section = rec.get("section")
-        for i, piece in enumerate(chunk_text(rec["text"], chunk_size, overlap)):
-            if _looks_like_toc(piece):
-                skipped_toc += 1
-                continue
-            chunked.append({
-                "source": rec["source"],
-                "page": rec["page"],
-                "chunk_id": i,
-                "section": section,
-                "text": f"{section}\n{piece}" if section else piece,
-            })
+        if rec["source"] != ctx_source:
+            ctx, ctx_source = _new_context(), rec["source"]
+        if _looks_like_toc(rec["text"]):
+            skipped_toc += 1
+            continue
+
+        by_title, order = defaultdict(list), []
+        for item in parse_page_lines(rec["text"], ctx):
+            if item["title"] not in by_title:
+                order.append(item["title"])
+            by_title[item["title"]].append(item)
+
+        chunk_id = 0
+        for title in order:
+            for group in _pack_lines(by_title[title], chunk_size, overlap):
+                chunked.append({
+                    "source": rec["source"],
+                    "page": rec["page"],
+                    "chunk_id": chunk_id,
+                    "section": title,
+                    "text": _render_chunk(group),
+                })
+                chunk_id += 1
     if skipped_toc:
-        print(f"Skipped {skipped_toc} table-of-contents-like chunk(s) during indexing.")
+        print(f"Skipped {skipped_toc} table-of-contents page(s) during indexing.")
     return chunked
 
 
@@ -340,10 +341,6 @@ def build_chunks(folder: str = None) -> list:
     print(f"Loading PDFs from {folder} ...")
     pages = load_pdfs_from_folder(folder)
     print(f"Loaded {len(pages)} pages total.\n")
-
-    print("Detecting section headings from each document's table of contents ...")
-    pages = tag_sections(pages)
-    print()
 
     print("Chunking text ...")
     chunks = chunk_records(pages, config.CHUNK_SIZE, config.CHUNK_OVERLAP)

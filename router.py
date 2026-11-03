@@ -9,7 +9,8 @@ Output shape (always -- a fully validated, machine-readable decision):
       "multiple_search_perspectives": bool,
       "has_metadata_constraints": bool,
       "is_vague_or_conversational": bool,
-      "route": "direct" | "rag" | "advanced_rag",
+      "needs_clarification": bool,
+      "route": "direct" | "rag" | "advanced_rag" | "clarify",
       "techniques": [...],
       "reason": "...",
     }
@@ -21,8 +22,7 @@ selects: "rewriting", "multi_query", "decomposition", "hyde".
 isn't a phrasing choice, it's a metadata filter, so advanced_rag.py acts
 on that boolean directly (via query_transform.self_query()) regardless
 of which of the four techniques were also picked. Advanced RAG always
-adds reranking, contextual_compression, and crag at execution time; the
-router does not need to select those stages.
+adds reranking at execution time; the router does not need to select it.
 
 The LLM is the primary classifier (it's the only thing that can actually
 read intent), but a small local model won't always return clean JSON, so
@@ -46,9 +46,11 @@ _ROUTER_SYSTEM_PROMPT = """You are a routing classifier for a document question-
 - multiple_search_perspectives: would it benefit from searching with several different phrasings/angles because the wording is abstract or could be described several ways?
 - has_metadata_constraints: does it carry a METADATA constraint -- a specific section name, page number, source document, department, year/date/version -- that should narrow the search rather than just being extra keywords?
 - is_vague_or_conversational: is the wording vague, conversational, or dependent on unstated context (e.g. "what about the second one", "and if it's damaged?") such that it needs to be rewritten into a clear standalone query before searching?
+- needs_clarification: is it about the manuals but so broad that several different procedures could be meant, and nothing in the question says which (e.g. "how are inventory cases handled?", when there are separate inventories for stationery warehouses, fixed assets, and loan files)? A question that names the specific procedure, or asks for something all of them share, does not need clarification.
 
 Then decide the route:
-- "direct": requires_documents is false (greetings, meta questions about the assistant, general knowledge unrelated to the manual, or a question already fully answered earlier in this exchange).
+- "direct": requires_documents is false (greetings, meta questions about the assistant, or anything outside the bank's procedures, such as sports, politics, or general knowledge). This route declines out-of-scope questions, so send them here rather than searching the manuals.
+- "clarify": needs_clarification is true. Takes priority over "rag" and "advanced_rag".
 - "rag": requires_documents is true, but it is a single, clear, well-formed, single-need question with no metadata constraint and no ambiguity -- plain hybrid retrieval + generation is enough.
 - "advanced_rag": requires_documents is true AND at least one of multiple_information_needs / multiple_search_perspectives / has_metadata_constraints / is_vague_or_conversational is true -- plain retrieval would likely handle it poorly.
 
@@ -58,14 +60,14 @@ If route is "advanced_rag", choose the SMALLEST set of techniques from this fixe
 - "decomposition": use when multiple_information_needs is true.
 - "hyde": use when the question is conceptual/asks "why" or "how does X work" in a way where a hypothetical answer passage would embed closer to the real answer than the bare question would.
 Do NOT put "self_query" in techniques -- metadata filtering is handled automatically from has_metadata_constraints, it is not a technique you select.
-If route is "rag" or "direct", techniques MUST be an empty list.
+If route is "rag", "direct", or "clarify", techniques MUST be an empty list.
 
 Respond with ONLY a single JSON object, no markdown fences, no extra text, matching exactly this shape:
-{"complexity": "simple|complex", "requires_documents": true|false, "multiple_information_needs": true|false, "multiple_search_perspectives": true|false, "has_metadata_constraints": true|false, "is_vague_or_conversational": true|false, "route": "direct|rag|advanced_rag", "techniques": [], "reason": "one short sentence"}
-The value of "route" must be exactly ONE of: "direct", "rag", "advanced_rag" -- do not copy the pipe-separated placeholder into the value.
+{"complexity": "simple|complex", "requires_documents": true|false, "multiple_information_needs": true|false, "multiple_search_perspectives": true|false, "has_metadata_constraints": true|false, "is_vague_or_conversational": true|false, "needs_clarification": true|false, "route": "direct|rag|advanced_rag|clarify", "techniques": [], "reason": "one short sentence"}
+The value of "route" must be exactly ONE of: "direct", "rag", "advanced_rag", "clarify" -- do not copy the pipe-separated placeholder into the value.
 The "reason" value is required and must be one short, non-empty sentence explaining the route choice.
 Example (a real decision, not the placeholders above):
-{"complexity": "complex", "requires_documents": true, "multiple_information_needs": true, "multiple_search_perspectives": true, "has_metadata_constraints": false, "is_vague_or_conversational": false, "route": "advanced_rag", "techniques": ["decomposition", "multi_query"], "reason": "Multiple information needs require decomposition and multiple retrieval perspectives."}
+{"complexity": "complex", "requires_documents": true, "multiple_information_needs": true, "multiple_search_perspectives": true, "has_metadata_constraints": false, "is_vague_or_conversational": false, "needs_clarification": false, "route": "advanced_rag", "techniques": ["decomposition", "multi_query"], "reason": "Multiple information needs require decomposition and multiple retrieval perspectives."}
 """
 
 
@@ -99,6 +101,7 @@ def _heuristic_classify(question: str, fallback_reason: str = None) -> dict:
             "multiple_search_perspectives": False,
             "has_metadata_constraints": False,
             "is_vague_or_conversational": False,
+            "needs_clarification": False,
             "route": "direct",
             "techniques": [],
             "reason": fallback_prefix,
@@ -191,11 +194,12 @@ def _validate(decision: dict, question: str) -> dict:
     if complexity not in config.VALID_COMPLEXITY:
         complexity = "complex" if route == "advanced_rag" else "simple"
 
-    requires_documents = _bool("requires_documents") or route in {"rag", "advanced_rag"}
+    requires_documents = _bool("requires_documents") or route in {"rag", "advanced_rag", "clarify"}
     multiple_information_needs = _bool("multiple_information_needs")
     multiple_search_perspectives = _bool("multiple_search_perspectives")
     has_metadata_constraints = _bool("has_metadata_constraints")
     is_vague_or_conversational = _bool("is_vague_or_conversational")
+    needs_clarification = route == "clarify"
 
     techniques = decision.get("techniques") or []
     if not isinstance(techniques, list):
@@ -260,6 +264,7 @@ def _validate(decision: dict, question: str) -> dict:
         "multiple_search_perspectives": multiple_search_perspectives,
         "has_metadata_constraints": has_metadata_constraints,
         "is_vague_or_conversational": is_vague_or_conversational,
+        "needs_clarification": needs_clarification,
         "route": route,
         "techniques": techniques,
         "reason": reason,
@@ -289,6 +294,8 @@ def classify_route(question: str) -> dict:
         decision = _extract_json(raw_text)
     except requests.exceptions.ConnectionError as exc:
         return _heuristic_classify(question, f"connection error: {exc}")
+    except RuntimeError as exc:  # rate limit, overload, or other API rejection
+        return _heuristic_classify(question, f"API error: {str(exc)[:240]}")
     except requests.exceptions.RequestException as exc:
         detail = f"request error: {exc}"
         if getattr(exc, "response", None) is not None:

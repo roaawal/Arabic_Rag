@@ -77,8 +77,26 @@ def _record_call(stage: str, model: str, input_tokens: int, output_tokens: int,
 
 
 _RETRY_STATUS = {429, 500, 502, 503, 504}
+_RETRY_IN_RE = re.compile(r"retry in (?:(\d+)h)?(?:(\d+)m)?(?:([\d.]+)s)?", re.IGNORECASE)
 # Models that rejected reasoning_effort: don't send it to them again.
 _effort_rejected = set()
+
+
+class LLMUnavailableError(RuntimeError):
+    """The API is rate-limited or overloaded; another model may still work."""
+
+
+def _retry_wait(response, attempt: int) -> float:
+    """Seconds to wait before retrying: what the API asked for if it said,
+    otherwise exponential backoff."""
+    header = response.headers.get("Retry-After", "")
+    if header.replace(".", "", 1).isdigit():
+        return float(header)
+    match = _RETRY_IN_RE.search(response.text)
+    if match and any(match.groups()):
+        hours, minutes, seconds = match.groups()
+        return int(hours or 0) * 3600 + int(minutes or 0) * 60 + float(seconds or 0)
+    return config.RETRY_BACKOFF_SECONDS * (2 ** attempt)
 
 
 def missing_key_message() -> str:
@@ -117,8 +135,10 @@ def call_completion(messages: list, max_tokens: int, temperature: float,
     while True:
         try:
             response = requests.post(url, headers=headers, json=payload, timeout=timeout)
-        except requests.exceptions.RequestException:
-            if attempt < config.MAX_RETRIES:
+        except requests.exceptions.RequestException as exc:
+            # A timed-out call has already waited the full timeout: retry once.
+            limit = 1 if isinstance(exc, requests.exceptions.Timeout) else config.MAX_RETRIES
+            if attempt < limit:
                 time.sleep(config.RETRY_BACKOFF_SECONDS * (2 ** attempt))
                 attempt += 1
                 continue
@@ -134,16 +154,19 @@ def call_completion(messages: list, max_tokens: int, temperature: float,
             payload.pop("reasoning_effort")
             continue
         if response.status_code in _RETRY_STATUS and attempt < config.MAX_RETRIES:
-            time.sleep(config.RETRY_BACKOFF_SECONDS * (2 ** attempt))
-            attempt += 1
-            continue
+            wait = _retry_wait(response, attempt)
+            if wait <= config.MAX_RETRY_WAIT_SECONDS:
+                time.sleep(wait)
+                attempt += 1
+                continue
         break
 
     latency_seconds = time.perf_counter() - start
     if not response.ok:
         detail = response.text.strip()
         _record_call(stage, model, 0, 0, latency_seconds, success=False)
-        raise RuntimeError(
+        error = LLMUnavailableError if response.status_code in _RETRY_STATUS else RuntimeError
+        raise error(
             f"The Gemini API rejected the {stage} request with HTTP "
             f"{response.status_code} for model {model!r}. Server response: {detail[:1000]}"
         )
@@ -232,6 +255,10 @@ def strip_inline_sources(text: str) -> str:
     return cleaned.strip()
 
 
+# A part of a procedure ("... - ثانياً. ..."), dropped when listing procedures.
+_ORDINAL_PART_RE = re.compile(r"\s-\s(?:أولا|ثانيا|ثالثا|رابعا|خامسا).*$")
+
+
 def build_grounded_prompt(question: str, hits: list) -> str:
     """
     The RAG-route final prompt. Requirements this MUST keep enforcing,
@@ -259,7 +286,7 @@ def build_grounded_prompt(question: str, hits: list) -> str:
 - أجب على السؤال الفعلي الذي طرحه المستخدم.
 - لا تختلق أي معلومة غير مدعومة بالسياق.
 - إذا كان السياق لا يدعم إجابة كاملة، اذكر ذلك بوضوح صراحةً بدلاً من التخمين.
-- أجب باللغة العربية الفصحى فقط من أول كلمة إلى آخر كلمة. ممنوع منعًا باتًا استخدام أي كلمة أو حرف باللغة الإنجليزية.
+- أجب باللغة العربية الفصحى، مع الإبقاء على أسماء الأنظمة والمصطلحات والاختصارات التقنية كما وردت في السياق بلغتها الأصلية (مثل BPM وRRN وDWH وVanguard).
 - تجاهل تمامًا أي معلومات إدارية أو شكلية من رأس أو تذييل الوثيقة (رقم الإصدار، تاريخ الإصدار، "للاستخدام الداخلي").
 - إذا كان المحتوى يصف إجراءً أو خطوات، اذكر كل خطوة مرقّمة بالترتيب، مع التفاصيل المهمة (من المسؤول، ما هي النماذج أو السجلات المطلوبة، التوقيت). لا تلخص في جملة واحدة قصيرة.
 - السياق أدناه هو المقتطفات المسترجعة فعلياً من الوثائق فقط -- لا تعتبر أي إعادة صياغة للسؤال أو فقرة افتراضية أو استعلامات بحث مولّدة دليلاً على الإطلاق.
@@ -293,19 +320,54 @@ Detailed answer:"""
 
 def build_direct_prompt(question: str) -> str:
     """
-    The "direct" route's prompt: no document context at all. Used
-    for genuinely general/conversational questions the router decided
-    don't need the corpus. Still answers in the question's language and
-    stays honest about not consulting any document.
+    The "direct" route's prompt: no document context at all. It replies to
+    greetings and questions about the assistant, and declines anything else
+    outside the manuals even if the model knows the answer, so this route can
+    never become a general-knowledge chatbot.
     """
     if is_arabic(question):
-        instruction = ("أجب على السؤال التالي بإيجاز ووضوح باللغة العربية الفصحى فقط. "
-                        "هذا سؤال عام لا يتطلب الرجوع إلى وثائق الشركة.")
+        instruction = ("أنت مساعد مخصص لأدلة إجراءات بنك الإسكان: الإنذار المركزي، والبريد المركزي "
+                        "والملفات، والموجودات وعمليات المستودعات. إذا كانت الرسالة تحية أو مجاملة أو "
+                        "سؤالاً عن قدراتك، فرد بإيجاز ولطف باللغة العربية الفصحى واعرض المساعدة. أما أي "
+                        "سؤال آخر خارج هذه الأدلة (معلومات عامة، رياضة، سياسة، وغيرها) فلا تجب عنه حتى لو "
+                        "كنت تعرف الإجابة: رد على التحية إن وجدت، ثم اعتذر موضحاً أنك تجيب فقط عن "
+                        "إجراءات هذه الأدلة.")
     else:
-        instruction = ("Answer the following question directly and concisely. "
-                        "This is a general question that does not require consulting "
-                        "any company documents.")
-    return f"{instruction}\n\nQuestion: {question}\n\nAnswer:"
+        instruction = ("You are an assistant dedicated to the Housing Bank procedure manuals: "
+                        "central alarm, central mail and files, and assets and warehouse "
+                        "operations. If the message is a greeting, small talk, or a question about "
+                        "your capabilities, reply briefly and offer help. Do not answer any other "
+                        "question outside these manuals, even if you know the answer: return any "
+                        "greeting, then apologize and explain that you only answer questions "
+                        "about these manuals.")
+    return f"{instruction}\n\nMessage: {question}\n\nReply:"
+
+
+def build_clarification(question: str, hits: list):
+    """
+    The "clarify" route's reply: asks which procedure the user means, offering
+    procedures actually found in the manuals. No LLM call, so it can't invent an
+    option. Returns None when the passages point at fewer than two procedures,
+    which means the question isn't ambiguous after all.
+    """
+    options = []
+    for h in hits:
+        section = h.get("section") or ""
+        if not re.match(r"\d", section):  # only numbered procedures, not "مقدمة:"
+            continue
+        title = _ORDINAL_PART_RE.sub("", section)
+        title = re.sub(r"^\d+\.\s*", "", title).rstrip(": ")
+        option = (title, config.source_label(h["source"]))
+        if option not in options:
+            options.append(option)
+    options = options[:config.CLARIFY_MAX_OPTIONS]
+    if len(options) < 2:
+        return None
+
+    numbered = "\n".join(f"{i}. {title} ({label})" for i, (title, label) in enumerate(options, 1))
+    if is_arabic(question):
+        return f"يوجد أكثر من إجراء قد ينطبق على سؤالك. يرجى تحديد الإجراء المقصود:\n{numbered}"
+    return f"More than one procedure may apply to your question. Please say which one you mean:\n{numbered}"
 
 
 def call_llm(prompt: str, arabic: bool, system_message: str = None,
@@ -313,12 +375,14 @@ def call_llm(prompt: str, arabic: bool, system_message: str = None,
              stage: str = "final_generation", model: str = None) -> dict:
     """
     Returns {"text": answer, "input_tokens": int, "output_tokens": int,
-    "latency_seconds": float}.
+    "latency_seconds": float, "model": model that answered}. If the model is
+    rate-limited, overloaded or timing out, config.GENERATION_FALLBACK_MODEL
+    answers instead, so the retrieval work already done isn't lost.
     """
     if system_message is None:
         if arabic:
             system_message = ("أنت مساعد دقيق يجيب فقط بناءً على السياق المُعطى عند توفره. "
-                               "تجيب دائمًا باللغة العربية الفصحى فقط، دون أي كلمات إنجليزية، "
+                               "تجيب دائمًا باللغة العربية الفصحى، وتبقي أسماء الأنظمة والاختصارات التقنية كما وردت في السياق، "
                                "وتقدّم إجابات كاملة ومفصّلة تعدّد كل خطوة من خطوات أي إجراء بدلاً "
                                "من تلخيصه في جملة واحدة، وتتجاهل أي معلومات شكلية من رأس أو تذييل "
                                "الوثيقة. لا تضف أي مصطلح أو اختصار أو معلومة غير موجودة في السياق، "
@@ -337,22 +401,37 @@ def call_llm(prompt: str, arabic: bool, system_message: str = None,
                                "not use general knowledge to fill gaps, and explicitly "
                                "say when the context is insufficient.")
 
-    result = call_completion(
-        messages=[
-            {"role": "system", "content": system_message},
-            {"role": "user", "content": prompt},
-        ],
-        max_tokens=max_tokens or config.MAX_NEW_TOKENS,
-        temperature=config.TEMPERATURE if temperature is None else temperature,
-        stage=stage,
-        model=model or config.GENERATION_MODEL,
-    )
+    model = model or config.GENERATION_MODEL
+
+    def _call(chosen_model):
+        return call_completion(
+            messages=[
+                {"role": "system", "content": system_message},
+                {"role": "user", "content": prompt},
+            ],
+            max_tokens=max_tokens or config.MAX_NEW_TOKENS,
+            temperature=config.TEMPERATURE if temperature is None else temperature,
+            stage=stage,
+            model=chosen_model,
+        )
+
+    try:
+        result = _call(model)
+    except (LLMUnavailableError, requests.exceptions.Timeout) as exc:
+        fallback = config.GENERATION_FALLBACK_MODEL
+        if not fallback or fallback == model:
+            raise
+        print(f"WARNING: {model} unavailable ({type(exc).__name__}); answering with {fallback}.",
+              file=sys.stderr)
+        model = fallback
+        result = _call(model)
 
     return {
         "text": result["text"],
         "input_tokens": result["input_tokens"],
         "output_tokens": result["output_tokens"],
         "latency_seconds": result["latency_seconds"],
+        "model": model,
     }
 
 

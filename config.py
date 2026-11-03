@@ -8,7 +8,7 @@ import os
 # --- OCR (Gemini vision; see ocr_backends.py) ---
 OCR_GEMINI_MODEL = "fast"   # "fast" = GEMINI_FAST_MODEL below
 OCR_DPI = 200
-OCR_STRIP_MARKDOWN = True
+OCR_STRIP_MARKDOWN = False  # ingestion.py reads titles, executors and tables from the Markdown
 OCR_CACHE_DIR = os.path.join(os.path.dirname(__file__), "ocr_cache")
 try:
     from dotenv import load_dotenv
@@ -28,7 +28,10 @@ CHUNK_SIZE = 800
 CHUNK_OVERLAP = 150
 
 # --- Retrieval ---
-TOP_K = 4
+# 8 rather than 4: multi-step and multi-part questions need several pages. On
+# the 12 document questions in the test set this raised the share of expected
+# pages found from 0.82 to 0.93.
+TOP_K = 8
 COLLECTION_NAME = "arabic_pdf_docs"
 
 # --- Hybrid retrieval (dense + BM25 keyword, fused via Reciprocal Rank
@@ -42,18 +45,6 @@ COLLECTION_NAME = "arabic_pdf_docs"
 USE_HYBRID_RETRIEVAL = True
 HYBRID_CANDIDATE_POOL = 20   # candidates each method contributes before fusion
 RRF_K = 60                   # standard reciprocal-rank-fusion constant
-
-# --- PDF cleanup (added after inspecting real scanned manuals) ---
-# Corporate Arabic manuals like the Housing Bank procedures manual repeat
-# an identical version/logo table (رقم النسخة / تاريخ الإصدار / اسم
-# الاجراء ...) as extracted TEXT on every single page. Left alone, that
-# boilerplate gets embedded into every chunk and dilutes both BM25 and
-# dense similarity (every chunk starts to look alike). ingestion.py
-# detects any line that repeats on at least this fraction of a document's
-# pages and strips it before chunking. 0.5 caught 14/15 pages of the
-# sample manual's header without touching real content (which naturally
-# varies page to page).
-HEADER_FOOTER_MIN_REPEAT_RATIO = 0.5
 
 # --- Source-text quality check ---
 # Some PDFs (confirmed on the Housing Bank sample: cross-checked with
@@ -101,6 +92,9 @@ RERANKER_MODEL = GEMINI_FAST_MODEL       # LLM-based reranking
 COMPRESSION_MODEL = GEMINI_FAST_MODEL    # contextual compression
 CRAG_MODEL = GEMINI_FAST_MODEL           # CRAG relevance grading
 JUDGE_MODEL = GEMINI_MAIN_MODEL          # LLM-as-judge evaluation
+# Used for the final answer when GENERATION_MODEL is rate-limited, overloaded
+# or timing out. None turns the fallback off.
+GENERATION_FALLBACK_MODEL = GEMINI_FAST_MODEL
 
 MAX_NEW_TOKENS = 2048
 TEMPERATURE = 0.2
@@ -132,6 +126,9 @@ THINKING_TOKEN_HEADROOM = 1024
 # Retries for transient API errors (rate limit 429, server 5xx).
 MAX_RETRIES = 3
 RETRY_BACKOFF_SECONDS = 2.0
+# Longest wait for one retry. The API says how long to wait when rate-limited;
+# past this (a daily quota can mean hours) the call fails at once instead.
+MAX_RETRY_WAIT_SECONDS = 60
 
 # --- Cost tracking ---
 # Standard paid-tier prices in USD per 1M tokens, from
@@ -154,6 +151,14 @@ MODEL_PRICING = {
 }
 
 
+def source_label(source: str) -> str:
+    """Arabic name of a manual from its file name, or the file name itself."""
+    for prefix, label in SOURCE_LABELS.items():
+        if source.startswith(prefix):
+            return label
+    return source
+
+
 def price_per_million(model: str, on: datetime.date = None):
     """(input_usd, output_usd) per 1M tokens for `model` on date `on`
     (default: today), or None if the model has no entry in MODEL_PRICING."""
@@ -169,6 +174,10 @@ def price_per_million(model: str, on: datetime.date = None):
 
 # --- LLM-as-judge evaluation ---
 # Which model answers the judge prompts: see JUDGE_MODEL above.
+# The judge adds a Flash request and a wait to every question, so it runs on
+# demand: when a reference answer is passed (evaluate_testset.py) or when this
+# is True.
+EVALUATE_EVERY_ANSWER = False
 JUDGE_MAX_NEW_TOKENS = 1024
 JUDGE_TEMPERATURE = 0.0  # deterministic scoring, not creative generation
 
@@ -177,18 +186,27 @@ JUDGE_TEMPERATURE = 0.0  # deterministic scoring, not creative generation
 # happens. Model: see ROUTER_MODEL above.
 ROUTER_MAX_NEW_TOKENS = 512
 ROUTER_TEMPERATURE = 0.0
-VALID_ROUTES = {"direct", "rag", "advanced_rag"}
+VALID_ROUTES = {"direct", "rag", "advanced_rag", "clarify"}
 # The router only ever SELECTS from these four query-understanding
 # techniques. self_query is intentionally not in this list: it isn't a
 # question of "should we try a different phrasing", it's a metadata
 # filter, so it's driven directly by the router's `has_metadata_constraints`
-# boolean instead (see router.py / advanced_rag.py). reranking,
-# contextual_compression, and crag are mandatory stages of the advanced
-# route, not techniques the router chooses -- they're recorded in
-# MANDATORY_ADVANCED_STAGES for logging/`techniques_used` purposes only.
+# boolean instead (see router.py / advanced_rag.py). reranking is a mandatory
+# stage of the advanced route, not a technique the router chooses -- it's
+# recorded in MANDATORY_ADVANCED_STAGES for logging/`techniques_used` only.
 VALID_TECHNIQUES = {"rewriting", "multi_query", "decomposition", "hyde"}
-MANDATORY_ADVANCED_STAGES = {"reranking", "contextual_compression", "crag"}
+MANDATORY_ADVANCED_STAGES = {"reranking"}
 VALID_COMPLEXITY = {"simple", "complex"}
+# Clarify route: how many passages to look through for candidate procedures,
+# and how many procedures to offer.
+CLARIFY_POOL = 12
+CLARIFY_MAX_OPTIONS = 5
+# Arabic name of each manual, by source-file prefix.
+SOURCE_LABELS = {
+    "Assets": "دليل الموجودات وعمليات المستودعات",
+    "Central Alarm": "دليل الإنذار المركزي",
+    "Central Mail": "دليل البريد المركزي والملفات",
+}
 
 # --- Advanced RAG: query understanding & transformation ---
 MULTI_QUERY_N = 3            # how many paraphrased query variants to generate
@@ -197,6 +215,10 @@ HYDE_MAX_NEW_TOKENS = 250    # hypothetical-answer length is meant to be short
 
 # --- Advanced RAG: retrieval improvement ---
 RERANK_CANDIDATE_POOL = 15   # how many fused hits go INTO the LLM reranker
-RERANK_KEEP_TOP_K = 5        # how many the reranker keeps for generation
+RERANK_KEEP_TOP_K = 8        # how many the reranker keeps for generation
+# Off until the test set shows they improve answers. Each adds LLM calls per
+# question, and compression can drop the title and executor lines from a chunk.
+USE_CONTEXTUAL_COMPRESSION = False
+USE_CRAG = False
 CRAG_MAX_CORRECTIONS = 1     # how many corrective re-retrieval attempts CRAG gets
 CRAG_CORRECTED_POOL_MULTIPLIER = 2  # widen HYBRID_CANDIDATE_POOL by this factor on correction
