@@ -63,11 +63,11 @@ def rerank(question: str, hits: list, keep_top_k: int = None) -> list:
         return hits
 
     candidates = hits[: config.RERANK_CANDIDATE_POOL]
-    passages = "\n\n".join(f'id="{h["id"]}":\n{h["text"][:500]}' for h in candidates)
+    passages = "\n\n".join(f'id="{h["id"]}":\n{h["text"][:1000]}' for h in candidates)
     user_prompt = f"Question: {question}\n\nPassages:\n{passages}"
 
     fallback_scores = {h["id"]: len(candidates) - i for i, h in enumerate(candidates)}
-    scores = _score_llm_json(_RERANK_SYSTEM, user_prompt, max_tokens=300, fallback=fallback_scores,
+    scores = _score_llm_json(_RERANK_SYSTEM, user_prompt, max_tokens=600, fallback=fallback_scores,
                               stage="reranking", model=config.RERANKER_MODEL)
     if not isinstance(scores, dict):
         scores = fallback_scores

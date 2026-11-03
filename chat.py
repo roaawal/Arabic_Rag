@@ -43,7 +43,7 @@ def main():
 def _print_retrieved_chunks(record):
     chunks = record.get("retrieved_chunks", [])
     if not chunks:
-        print("Retrieved chunks: none (this question used the direct LLM route)")
+        print("Retrieved chunks: none")
         return
 
     print("Retrieved chunks:")
@@ -72,6 +72,8 @@ def _print_metrics(record):
             f"latency={call['latency_seconds']:.2f}s "
             f"model={call['model']}"
         )
+    if record.get("judge_notes") is None:
+        return
     print(
         "Evaluation: "
         f"Context Relevance={record.get('context_relevance')} | "
@@ -202,7 +204,7 @@ def _run_streamlit_app():
                 st.caption(f"Chunk ID: {chunk['id']} · retrieval score: {chunk['score']:.3f}")
                 st.write(chunk.get("text", "Passage text is unavailable for this result."))
     else:
-        st.caption("This answer used the direct assistant route and did not retrieve a document passage.")
+        st.caption("This reply did not use a document passage.")
 
     if show_details:
         with st.expander("Route and retrieval details"):
@@ -225,13 +227,14 @@ def _run_streamlit_app():
             f"Answer ${record.get('answer_cost', 0):.6f} in {record.get('answer_seconds', 0):.2f}s · "
             f"Evaluation ${record.get('evaluation_cost', 0):.6f} in {record.get('evaluation_seconds', 0):.2f}s"
         )
-        st.caption(
-            "Evaluation: "
-            f"Context relevance {record.get('context_relevance')} · "
-            f"Faithfulness {record.get('faithfulness')} · "
-            f"Answer relevance {record.get('answer_relevance')} · "
-            f"Correctness {record.get('correctness')}"
-        )
+        if record.get("judge_notes") is not None:
+            st.caption(
+                "Evaluation: "
+                f"Context relevance {record.get('context_relevance')} · "
+                f"Faithfulness {record.get('faithfulness')} · "
+                f"Answer relevance {record.get('answer_relevance')} · "
+                f"Correctness {record.get('correctness')}"
+            )
 
 
 if __name__ == "__main__":

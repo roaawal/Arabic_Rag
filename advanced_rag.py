@@ -2,8 +2,8 @@
 Advanced RAG orchestration.
 
 Applies the query-understanding techniques the router actually selected,
-then always runs retrieval, reranking, contextual compression, and CRAG,
-in that fixed order:
+then always runs retrieval and reranking, plus contextual compression and
+CRAG when turned on in config.py, in that fixed order:
 
   1. self_query      -> metadata filter + cleaned question. Driven
      directly by the router's `has_metadata_constraints` flag, NOT by
@@ -19,18 +19,16 @@ in that fixed order:
      the search-query list
   5. hybrid retrieval, once per search query, fused across queries via RRF
   6. reranking          -> keep the LLM-rescored top few
-  7. contextual_compression -> trim the surviving chunks to relevant
-     sentences
-  8. crag               -> grade the (reranked + compressed) evidence;
-     one corrective re-retrieval -> rerank -> compression attempt if
-     graded ambiguous/incorrect
+  7. contextual_compression (config.USE_CONTEXTUAL_COMPRESSION) -> trim the
+     surviving chunks to relevant sentences
+  8. crag (config.USE_CRAG) -> grade the evidence; one corrective
+     re-retrieval attempt if graded ambiguous/incorrect
   9. final grounded generation (generation.py -- same module every route
      uses)
 
 If none of the four query-understanding techniques were selected, the
 raw (or self_query-cleaned) question is used as the single search query.
-Retrieval, reranking, compression, and CRAG are mandatory for every
-advanced_rag question.
+Retrieval and reranking are mandatory for every advanced_rag question.
 
 HyDE passages, rewrites, decomposed sub-questions, and multi-query
 variants exist ONLY to build search queries for retrieval -- they are
@@ -80,7 +78,7 @@ def answer_advanced(question: str, decision: dict, top_k: int = None) -> dict:
     self_query_filter, crag_grade, crag_corrected.
     """
     techniques = list(decision.get("techniques") or [])
-    top_k = top_k or config.TOP_K
+    top_k = top_k or config.RERANK_KEEP_TOP_K
     total_start = time.perf_counter()
     executed_steps = ["router"]
 
@@ -135,36 +133,42 @@ def answer_advanced(question: str, decision: dict, top_k: int = None) -> dict:
     num_after_reranking = len(hits)
 
     # 7. contextual compression
-    print("[pipeline] executing: contextual_compression")
-    executed_steps.append("contextual_compression")
-    hits = retrieval_improve.contextual_compression(cleaned_question, hits)
-    num_after_compression = len(hits)
+    num_after_compression = None
+    if config.USE_CONTEXTUAL_COMPRESSION:
+        print("[pipeline] executing: contextual_compression")
+        executed_steps.append("contextual_compression")
+        hits = retrieval_improve.contextual_compression(cleaned_question, hits)
+        num_after_compression = len(hits)
 
     # 8. CRAG -- grades the reranked + compressed evidence. A corrective
     # attempt re-runs retrieval -> rerank -> compression with a widened
     # pool, so a correction's output has gone through the exact same
     # steps as the first attempt before CRAG re-grades it.
-    print("[pipeline] executing: crag")
-    executed_steps.append("crag")
+    crag_grade, crag_corrected = None, False
+    if config.USE_CRAG:
+        print("[pipeline] executing: crag")
+        executed_steps.append("crag")
 
-    def _corrective_retrieve():
-        wider_pool = retrieval_pool * config.CRAG_CORRECTED_POOL_MULTIPLIER
-        corrected = _multi_query_retrieve(search_queries, where_filter, wider_pool)
-        corrected = retrieval_improve.rerank(cleaned_question, corrected, keep_top_k=top_k)
-        corrected = retrieval_improve.contextual_compression(cleaned_question, corrected)
-        return corrected
+        def _corrective_retrieve():
+            wider_pool = retrieval_pool * config.CRAG_CORRECTED_POOL_MULTIPLIER
+            corrected = _multi_query_retrieve(search_queries, where_filter, wider_pool)
+            corrected = retrieval_improve.rerank(cleaned_question, corrected, keep_top_k=top_k)
+            if config.USE_CONTEXTUAL_COMPRESSION:
+                corrected = retrieval_improve.contextual_compression(cleaned_question, corrected)
+            return corrected
 
-    crag_result = retrieval_improve.crag_evaluate_and_correct(
-        cleaned_question, hits, _corrective_retrieve, top_k
-    )
-    hits = crag_result["hits"]
-    crag_grade = crag_result["grade"]
-    crag_corrected = crag_result["corrected"]
-    if crag_corrected:
-        # The corrected hits already passed through rerank + compression
-        # inside _corrective_retrieve, so the "after" counts reflect them.
-        num_after_reranking = len(hits)
-        num_after_compression = len(hits)
+        crag_result = retrieval_improve.crag_evaluate_and_correct(
+            cleaned_question, hits, _corrective_retrieve, top_k
+        )
+        hits = crag_result["hits"]
+        crag_grade = crag_result["grade"]
+        crag_corrected = crag_result["corrected"]
+        if crag_corrected:
+            # The corrected hits already passed through rerank (and compression
+            # if on) inside _corrective_retrieve, so the "after" counts reflect them.
+            num_after_reranking = len(hits)
+            if config.USE_CONTEXTUAL_COMPRESSION:
+                num_after_compression = len(hits)
 
     # 9. final grounded generation -- same shared module every route uses.
     # `hits` here are the only things that ever reach the prompt as
@@ -180,11 +184,13 @@ def answer_advanced(question: str, decision: dict, top_k: int = None) -> dict:
 
     input_tokens = result["input_tokens"]
     output_tokens = result["output_tokens"]
-    cost = generation.compute_cost(config.GENERATION_MODEL, input_tokens, output_tokens)
+    cost = generation.compute_cost(result["model"], input_tokens, output_tokens)
 
     techniques_used = sorted(
         set(techniques)
         | config.MANDATORY_ADVANCED_STAGES
+        | ({"contextual_compression"} if config.USE_CONTEXTUAL_COMPRESSION else set())
+        | ({"crag"} if config.USE_CRAG else set())
         | ({"self_query"} if decision.get("has_metadata_constraints") else set())
     )
 
@@ -221,6 +227,7 @@ def answer_advanced(question: str, decision: dict, top_k: int = None) -> dict:
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "cost": cost,
+        "generation_model": result["model"],
         "latency_seconds": result["latency_seconds"],
         "total_latency_seconds": time.perf_counter() - total_start,
     }

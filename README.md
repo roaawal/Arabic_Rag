@@ -26,10 +26,10 @@ PDF files
 Gemini vision OCR of each page image (cached in ocr_cache/)
    |
    v
-Header/footer cleanup and section detection
+Procedure structure read from the OCR Markdown
    |
    v
-Arabic-aware chunking
+Chunking by procedure and page
    |
    v
 Embeddings stored in ChromaDB
@@ -37,20 +37,20 @@ Embeddings stored in ChromaDB
 User question
    |
    v
-Router: direct / rag / advanced_rag
+Router: direct / rag / advanced_rag / clarify
    |
-   +--> Direct generation
+   +--> Direct reply (greetings; declines out-of-scope questions)
+   |
+   +--> Clarifying question listing the procedures found
    |
    +--> Hybrid retrieval: dense search + BM25 + RRF
    |
-   +--> Advanced retrieval: rewriting, decomposition, reranking,
-        compression, and corrective retrieval
+   +--> Advanced retrieval: rewriting, decomposition, reranking
    |
    v
 Grounded answer generation
-   |
-   v
-LLM-as-judge evaluation
+
+Separately: evaluate_testset.py runs a test set and the LLM judge
 ```
 
 ## Project Files
@@ -60,7 +60,7 @@ LLM-as-judge evaluation
 | `chat.py` | Command-line and Streamlit user interface |
 | `pipeline.py` | Main entry point and route orchestration |
 | `config.py` | Central configuration for models, OCR, retrieval, and evaluation |
-| `ingestion.py` | Full ingestion pipeline: OCR, cleanup, section detection, chunking, embedding, and ChromaDB indexing |
+| `ingestion.py` | Full ingestion pipeline: OCR, procedure structure, chunking, embedding, and ChromaDB indexing |
 | `ocr_backends.py` | Gemini vision OCR of PDF pages, with an on-disk cache |
 | `ocr_compare.py` | Benchmark for comparing OCR models against hand-typed ground truth |
 | `rag.py` | Dense retrieval, BM25 retrieval, and Reciprocal Rank Fusion |
@@ -70,8 +70,9 @@ LLM-as-judge evaluation
 | `retrieval_improve.py` | Reranking, contextual compression, and CRAG |
 | `generation.py` | Gemini API calls, prompts, token/cost tracking, and latency tracking |
 | `evaluate.py` | LLM-as-judge evaluation |
+| `evaluate_testset.py` | Runs a test set: page recall, routes, and judged correctness |
 | `data/` | Source PDF manuals |
-| `ground_truth/` | Hand-typed reference pages used by `ocr_compare.py` |
+| `ground_truth/` | Git-ignored: hand-typed pages for `ocr_compare.py`, the RAG test set, and its results |
 | `ocr_cache/` | Cached OCR output per PDF and model |
 | `chroma_store/` | Persistent local vector database |
 
@@ -132,23 +133,24 @@ responses to improve its products; on the paid tier it does not.
 | --- | --- | --- |
 | OCR of PDF pages | `gemini-3.5-flash-lite` | Near-perfect Arabic transcription in testing at a fraction of a cent per page |
 | Router and helper stages (rewriting, multi-query, decomposition, HyDE, reranking, compression, CRAG) | `gemini-3.5-flash-lite` | Short classification, JSON and scoring calls; cheapest tier |
-| Answer generation | `gemini-3.8-flash` | Newest Flash model; same price as `gemini-3.6-flash` |
+| Answer generation | `gemini-3.8-flash` | Newest Flash model; same price as `gemini-3.6-flash`. Falls back to `gemini-3.5-flash-lite` when rate-limited, overloaded or timing out |
 | Evaluation judge | `gemini-3.8-flash` | Flash-tier judgement at low thinking effort |
 
 Change them in `config.py` (`GEMINI_FAST_MODEL`, `GEMINI_MAIN_MODEL`, `OCR_GEMINI_MODEL`, or
-any per-stage `*_MODEL`).
+any per-stage `*_MODEL`, or `GENERATION_FALLBACK_MODEL`).
+
+Rate-limited calls wait as long as the API asks, up to `MAX_RETRY_WAIT_SECONDS`. If the wait
+would be longer, such as an exhausted daily quota, the call fails at once.
 
 ### Cost and time per question
 
-Every question prints (and the web UI shows) the cost and wall-clock time, split into the
-answer and the evaluation judge call, plus every LLM call with its tokens, thinking tokens,
-cost and latency. Cost is computed from `MODEL_PRICING` in `config.py`, which holds the
+Every question prints (and the web UI shows) the cost and wall-clock time, plus every LLM
+call with its tokens, thinking tokens, cost and latency. When the judge runs, its cost and
+time are shown separately. Cost is computed from `MODEL_PRICING` in `config.py`, which holds the
 standard paid-tier prices checked on 2026-10-20 and applies announced price changes on their
 start date (for example the Flash price doubling on 2027-01-01). Thinking tokens are billed
 as output tokens and are included. Update the table when Google changes prices or you switch
 models: https://ai.google.dev/gemini-api/docs/pricing
-
-The judge runs on every question, so its cost and time are always part of the total.
 
 ## Build the Index
 
@@ -160,14 +162,16 @@ python ingestion.py
 
 Index construction performs these steps:
 
-1. Render every PDF page to an image and transcribe it with Gemini vision (cached).
-2. Remove repeated headers and footers.
-3. Warn about suspicious OCR output (mixed-script words, malformed common words).
-4. Detect section headings from tables of contents.
-5. Split text into overlapping chunks.
-6. Skip table-of-contents-like chunks.
-7. Generate normalized `BAAI/bge-m3` embeddings.
-8. Store text, embeddings, and metadata in ChromaDB.
+1. Render every PDF page to an image and transcribe it with Gemini vision (cached). The OCR
+   prompt leaves out running headers and footers.
+2. Warn about suspicious OCR output (mixed-script words, malformed common words).
+3. Skip table-of-contents pages.
+4. Read procedure titles, executing departments, executors and tables from the OCR Markdown.
+   A procedure's context carries over from page to page.
+5. Split each procedure on each page into overlapping chunks. Every chunk starts with its
+   title, department and executor, and each table row keeps its column names.
+6. Generate normalized `BAAI/bge-m3` embeddings.
+7. Store text, embeddings, and metadata in ChromaDB.
 
 The current chunk configuration is:
 
@@ -192,7 +196,7 @@ steps. Running page headers and footers are dropped.
 |---|---|---|
 | `OCR_GEMINI_MODEL` | `"fast"` | `"fast"` = `GEMINI_FAST_MODEL`, or a concrete model id |
 | `OCR_DPI` | `200` | Resolution of the page image sent to Gemini |
-| `OCR_STRIP_MARKDOWN` | `True` | Flatten OCR Markdown to plain lines for the chunker |
+| `OCR_STRIP_MARKDOWN` | `False` | Keep the OCR Markdown, which the chunker reads the structure from |
 
 - OCR results are cached in `ocr_cache/`, per PDF content and model. Rebuilding the index
   does not re-OCR unchanged PDFs. Delete the folder (or a single page file in it) to force
@@ -268,15 +272,22 @@ path, token usage, latency, cost, and evaluation values.
 
 ### Direct route
 
-Used for general or conversational questions that do not require the indexed manuals.
-No document retrieval occurs.
+Used for greetings, questions about the assistant, and questions outside the manuals. It
+replies to the first two and declines the rest, even when the model knows the answer. No
+document retrieval occurs.
+
+### Clarify route
+
+Used when several different procedures could be meant and the question does not say which.
+The reply lists the numbered procedures that retrieval actually found, with no LLM call. If
+retrieval finds fewer than two, the question is answered through basic RAG instead.
 
 ### Basic RAG route
 
 Used for a clear document question with one information need:
 
 ```text
-router -> hybrid retrieval -> grounded generation -> evaluation
+router -> hybrid retrieval -> grounded generation
 ```
 
 ### Advanced RAG route
@@ -291,11 +302,12 @@ router
   -> optional HyDE query
   -> hybrid retrieval
   -> LLM reranking
-  -> contextual compression
-  -> CRAG grading and one corrective retrieval
   -> grounded generation
-  -> evaluation
 ```
+
+Contextual compression and CRAG are available but off (`USE_CONTEXTUAL_COMPRESSION` and
+`USE_CRAG` in `config.py`). Turn them on only if `evaluate_testset.py` shows they improve
+answers.
 
 Generated rewrites, hypothetical passages, and search queries are used only to improve
 retrieval. They are not passed to the final answer as document evidence.
@@ -333,10 +345,12 @@ appears near the top in both retrieval methods.
 - **HyDE:** creates a hypothetical passage to improve embedding-based search. It is never
   treated as evidence.
 - **Self-query:** converts page, source, or section constraints into Chroma metadata filters.
+  A manual can be named in Arabic ("في دليل الإنذار المركزي").
 - **Reranking:** asks the helper model to score retrieved passages for direct relevance.
-- **Contextual compression:** keeps only relevant original sentences from each passage.
-- **CRAG:** grades retrieved context and retries retrieval once with a wider candidate pool
-  when the evidence is ambiguous or incorrect.
+- **Contextual compression (off by default):** keeps only relevant original sentences from
+  each passage.
+- **CRAG (off by default):** grades retrieved context and retries retrieval once with a wider
+  candidate pool when the evidence is ambiguous or incorrect.
 
 ## Grounding and Answer Behavior
 
@@ -348,7 +362,8 @@ The final prompt instructs the model to:
 - State clearly when the context is insufficient.
 - Preserve all important procedure steps.
 - Include responsible roles, forms, records, and timing when available.
-- Answer Arabic questions in Modern Standard Arabic.
+- Answer Arabic questions in Modern Standard Arabic, keeping system names and technical
+  abbreviations such as BPM and RRN as they appear in the context.
 - Ignore repeated administrative headers and footers.
 
 Sources are shown in a separate Sources section with chunk IDs and page numbers. Any source
@@ -360,7 +375,21 @@ misread an OCR error or make an incorrect interpretation.
 
 ## Evaluation
 
-Each answer is evaluated using four scores from 0 to 5:
+The LLM judge does not run while a user waits. It runs when a reference answer is passed to
+`pipeline.answer(..., reference=...)`, which `evaluate_testset.py` does, or for every answer
+if `EVALUATE_EVERY_ANSWER` is `True` in `config.py`.
+
+```powershell
+python evaluate_testset.py --retrieval-only
+python evaluate_testset.py --delay 15
+```
+
+The first command checks locally, with no API calls, that the expected pages are retrieved.
+The second runs the full pipeline and saves results to `ground_truth/eval_results.json` after
+every question. It stops after two failures in a row. The test set is
+`ground_truth/rag_testset.json`, git-ignored because it quotes the manuals.
+
+Answers are evaluated using four scores from 0 to 5:
 
 | Metric | Meaning |
 |---|---|
@@ -375,8 +404,7 @@ available. Context relevance and faithfulness are `None` on the direct route, wh
 retrieved context.
 
 The evaluator is also an LLM, so scores are useful for comparison and regression
-detection but should not be treated as absolute ground truth. Scores are shown with each
-answer; they are not saved to disk.
+detection but should not be treated as absolute ground truth.
 
 ## Troubleshooting
 
@@ -417,15 +445,17 @@ Check the following in order:
 3. The retrieved source pages are relevant.
 4. The question is specific enough.
 5. The router selected the correct route.
-6. `config.py` points at the intended Gemini models.
+6. `python evaluate_testset.py --retrieval-only` still finds the expected pages.
+7. `config.py` points at the intended Gemini models.
 
 ## Quick Presentation Summary
 
 This project is an Arabic RAG system for querying internal procedure manuals. It transcribes
-PDF pages with Gemini vision OCR (the PDFs' own text layer is corrupted), cleans and chunks
-the text, embeds the chunks locally with `BAAI/bge-m3`, and stores them in ChromaDB. A
-router chooses between direct answering, basic hybrid RAG, and advanced RAG. Hybrid retrieval
-combines semantic embeddings with BM25 keyword search through Reciprocal Rank Fusion. The
-advanced pipeline can rewrite, decompose, rerank, compress, and correct retrieval results.
-The final model answers only from retrieved document passages and returns source information.
-Every request is evaluated and reports retrieval, quality, token, cost, and latency data.
+PDF pages with Gemini vision OCR (the PDFs' own text layer is corrupted), chunks the text by
+procedure, embeds the chunks locally with `BAAI/bge-m3`, and stores them in ChromaDB. A router
+chooses between a direct reply, basic hybrid RAG, advanced RAG, and asking a clarifying
+question. Hybrid retrieval combines semantic embeddings with BM25 keyword search through
+Reciprocal Rank Fusion. The advanced pipeline can rewrite, decompose, and rerank. The final
+model answers only from retrieved document passages and returns source information. Every
+request reports token, cost, and latency data, and a separate script evaluates quality on a
+test set.

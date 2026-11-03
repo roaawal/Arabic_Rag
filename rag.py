@@ -243,7 +243,7 @@ def answer_question_full(question: str, top_k: int = None) -> dict:
 
     input_tokens = result["input_tokens"]
     output_tokens = result["output_tokens"]
-    cost = generation.compute_cost(config.GENERATION_MODEL, input_tokens, output_tokens)
+    cost = generation.compute_cost(result["model"], input_tokens, output_tokens)
 
     return {
         "record_id": str(uuid.uuid4()),
@@ -272,6 +272,7 @@ def answer_question_full(question: str, top_k: int = None) -> dict:
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "cost": cost,
+        "generation_model": result["model"],
         "latency_seconds": result["latency_seconds"],
         "total_latency_seconds": time.perf_counter() - total_start,
     }
